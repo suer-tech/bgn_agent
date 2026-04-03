@@ -21,8 +21,11 @@ from bitgn.harness_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
-from agent import run_agent
+from self_evolution.executor import run_task_with_prompt
+from orchestrator import Orchestrator
+from agents.prompt_storage import get_prompt
 from llm_provider import create_provider
+from llm_logger import LLMTraceLogger
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 
@@ -63,8 +66,20 @@ def main() -> None:
             print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
             try:
-                run_agent(
-                    provider, trial.harness_url, trial.instruction, task_id=t.task_id
+                trace_logger = LLMTraceLogger(
+                    log_dir="logs/main",
+                    keep_last_only=False,
+                    per_task_files=True,
+                )
+                result = run_task_with_prompt(
+                    provider=provider,
+                    harness_url=trial.harness_url,
+                    task_text=trial.instruction,
+                    task_id=t.task_id,
+                    system_prompt=get_prompt("execution_agent"),
+                    max_iterations=30,
+                    silent=False,
+                    trace_logger=trace_logger,
                 )
             except Exception as e:
                 print(e)
