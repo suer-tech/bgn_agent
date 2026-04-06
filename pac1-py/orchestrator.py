@@ -1,47 +1,35 @@
+"""Orchestrator — State Machine pipeline for PAC1.
+
+Flow:
+1. Initialize AgentState
+2. Triage (1 LLM call) → early exit if ATTACK/UNSUPPORTED
+3. Bootstrap (0 LLM calls) → load workspace rules via regex
+4. Execution Loop (max 30 steps):
+   a. build_planner_prompt() + plan_next_step()
+   b. Update Scratchpad from LLM response
+   c. If report_completion → break
+   d. execute_tool() → add to conversation_history
+5. Send AnswerRequest to PCM (ONLY here!)
+6. Log everything
+"""
+
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from agents.execution_agent import (
-    NextStep,
-    ReportTaskCompletion,
-    Req_Context,
-    Req_Tree,
-    Req_Find,
-    Req_Search,
-    Req_List,
-    Req_Read,
-    Req_Write,
-    Req_Delete,
-    Req_MkDir,
-    Req_Move,
-)
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import (
-    AnswerRequest,
-    ContextRequest,
-    DeleteRequest,
-    FindRequest,
-    ListRequest,
-    MkDirRequest,
-    MoveRequest,
-    Outcome,
-    ReadRequest,
-    SearchRequest,
-    TreeRequest,
-    WriteRequest,
-)
-from connectrpc.errors import ConnectError
-from google.protobuf.json_format import MessageToDict
 
-from agents import (
-    SecurityGate,
-    ContextExtractor,
-    ExecutionAgent,
-    TaskContext,
-    SecurityCheckResult,
-    ContextResult,
+from agents.types import (
+    AgentState,
+    ScratchpadState,
+    ReportTaskCompletion,
+    get_outcome_map,
 )
+from agents.triage_node import run_triage
+from agents.bootstrap_node import run_bootstrap
+from agents.execution_agent import build_planner_prompt, plan_next_step
+from agents.tool_executor import execute_tool
+from agents.pcm_helpers import send_answer
 from llm_logger import LLMTraceLogger
 
 
@@ -51,101 +39,20 @@ CLI_CLR = "\x1b[0m"
 CLI_YELLOW = "\x1b[33m"
 CLI_BLUE = "\x1b[34m"
 
-OUTCOME_BY_NAME = {
-    "OUTCOME_OK": Outcome.OUTCOME_OK,
-    "OUTCOME_DENIED_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,
-    "OUTCOME_NONE_CLARIFICATION": Outcome.OUTCOME_NONE_CLARIFICATION,
-    "OUTCOME_NONE_UNSUPPORTED": Outcome.OUTCOME_NONE_UNSUPPORTED,
-    "OUTCOME_ERR_INTERNAL": Outcome.OUTCOME_ERR_INTERNAL,
-}
-
-
-def dispatch_pac1(vm: PcmRuntimeClientSync, cmd):
-    """Dispatch command to PCM runtime."""
-    if isinstance(cmd, Req_Context):
-        return vm.context(ContextRequest())
-    if isinstance(cmd, Req_Tree):
-        return vm.tree(TreeRequest(root=cmd.root, level=cmd.level))
-    if isinstance(cmd, Req_Find):
-        return vm.find(
-            FindRequest(
-                root=cmd.root,
-                name=cmd.name,
-                type={"all": 0, "files": 1, "dirs": 2}[cmd.kind],
-                limit=cmd.limit,
-            )
-        )
-    if isinstance(cmd, Req_Search):
-        return vm.search(
-            SearchRequest(root=cmd.root, pattern=cmd.pattern, limit=cmd.limit)
-        )
-    if isinstance(cmd, Req_List):
-        return vm.list(ListRequest(name=cmd.path))
-    if isinstance(cmd, Req_Read):
-        return vm.read(
-            ReadRequest(
-                path=cmd.path,
-                number=cmd.number,
-                start_line=cmd.start_line,
-                end_line=cmd.end_line,
-            )
-        )
-    if isinstance(cmd, Req_Write):
-        return vm.write(
-            WriteRequest(
-                path=cmd.path,
-                content=cmd.content,
-                start_line=cmd.start_line,
-                end_line=cmd.end_line,
-            )
-        )
-    if isinstance(cmd, Req_Delete):
-        return vm.delete(DeleteRequest(path=cmd.path))
-    if isinstance(cmd, Req_MkDir):
-        return vm.mk_dir(MkDirRequest(path=cmd.path))
-    if isinstance(cmd, Req_Move):
-        return vm.move(MoveRequest(from_name=cmd.from_name, to_name=cmd.to_name))
-    if isinstance(cmd, ReportTaskCompletion):
-        return vm.answer(
-            AnswerRequest(
-                message=cmd.message,
-                outcome=OUTCOME_BY_NAME[cmd.outcome],
-                refs=cmd.grounding_refs,
-            )
-        )
-    raise ValueError(f"Unknown command: {cmd}")
-
 
 class Orchestrator:
-    """
-    Main orchestrator that coordinates all sub-agents for PAC1:
+    """State Machine orchestrator for PAC1 multi-agent pipeline.
 
-    1. Security Gate (input) -- validates task text for injections
-    2. Context Extractor -- extracts workspace structure and instruction graph
-    3. Security Gate (context) -- validates extracted context
-    4. Execution Agent -- executes the task with enriched context
-    5. Security Gate (tool calls) -- validates each tool call before execution
-
-    All steps are logged to pac1-py/logs/
+    Coordinates: Triage → Bootstrap → Execution Loop → Answer.
+    Only the orchestrator sends AnswerRequest to PCM.
     """
 
     def __init__(
         self,
         provider=None,
-        system_prompt: str = None,
         trace_logger: Optional[LLMTraceLogger] = None,
     ):
         self.provider = provider
-        self.system_prompt = system_prompt
-
-        # Initialize all agents
-        self.security_gate = SecurityGate(provider=provider)
-        self.context_extractor = ContextExtractor(provider=provider, trace_logger=trace_logger)
-        self.execution_agent = ExecutionAgent(
-            provider=provider, system_prompt=system_prompt, trace_logger=trace_logger
-        )
-
-        # Logger
         self.trace_logger = trace_logger or LLMTraceLogger()
 
     def run(
@@ -155,318 +62,259 @@ class Orchestrator:
         task_id: str,
         max_iterations: int = 30,
     ) -> Dict[str, Any]:
-        """
-        Run the full orchestrator pipeline.
-
-        Flow:
-        1. Security check on input
-        2. Extract context (directory structure + instruction graph)
-        3. Security check on extracted context
-        4. Execute task with enriched context
-        5. Log all steps
+        """Run the full State Machine pipeline.
 
         Returns:
-            Dictionary with results
+            Dictionary with task results.
         """
         start_time = time.time()
-        tool_calls = []
-        completed_steps = []
-        final_answer = ""
-        grounding_refs = []
-        outcome = "OUTCOME_ERR_INTERNAL"
 
         print(f"\n{CLI_BLUE}{'=' * 60}")
-        print(f"ORCHESTRATOR STARTING - Task: {task_id}")
-        print(f"{'=' * 60}{CLI_CLR}\n")
+        print(f"ORCHESTRATOR STARTING - Task: {task_id}", flush=True)
+        print(f"{'=' * 60}{CLI_CLR}\n", flush=True)
 
         # Set up logger
         self.trace_logger.set_task(task_id, task_text)
 
-        # ===== Phase 1: Security check on input =====
-        print(f"{CLI_YELLOW}[1/5] Security check on input...{CLI_CLR}")
-        input_security = self.security_gate.check_input(task_text)
-
-        if not input_security.allowed:
-            print(f"{CLI_RED}INPUT BLOCKED: {input_security.reason}{CLI_CLR}")
-            return self._create_error_result(
-                task_id, "blocked_by_security", input_security.reason
-            )
-
-        if input_security.injection_detected:
-            print(
-                f"{CLI_YELLOW}Injection detected: {input_security.injection_type}{CLI_CLR}"
-            )
-            task_text = input_security.sanitized_input or task_text
-
-        self.trace_logger.log_agent_event(
-            agent_name="security_gate",
-            event="input_check",
-            details={
-                "allowed": input_security.allowed,
-                "injection_detected": input_security.injection_detected,
-                "injection_type": input_security.injection_type,
-            },
-        )
-
-        # ===== Phase 2: Extract context =====
-        print(f"{CLI_YELLOW}[2/5] Extracting context...{CLI_CLR}")
-        try:
-            context_result = self.context_extractor.extract_with_llm(
-                harness_url=harness_url,
-                task_text=task_text,
-            )
-            print(
-                f"{CLI_GREEN}Context extracted: {context_result.extract_status}{CLI_CLR}"
-            )
-
-            # Show directory structure
-            if context_result.directory_tree_formatted:
-                print(f"{CLI_BLUE}Directory structure:{CLI_CLR}")
-                try:
-                    print(context_result.directory_tree_formatted[:500])
-                except UnicodeEncodeError:
-                    # Fallback for encoding issues
-                    safe_output = (
-                        context_result.directory_tree_formatted[:500]
-                        .encode("utf-8", errors="replace")
-                        .decode("utf-8", errors="replace")
-                    )
-                    print(safe_output)
-
-            # Show instruction graph
-            if context_result.instruction_dependency_graph:
-                graph = context_result.instruction_dependency_graph
-                print(f"{CLI_BLUE}Instruction graph hierarchy:{CLI_CLR}")
-                print(f"  {' -> '.join(graph.hierarchy)}")
-
-        except Exception as e:
-            print(f"{CLI_RED}Context extraction failed: {e}{CLI_CLR}")
-            context_result = ContextResult(extract_status="failed")
-
-        self.trace_logger.log_agent_event(
-            agent_name="context_extractor",
-            event="extract_complete",
-            details={
-                "status": context_result.extract_status,
-                "agents_md_path": context_result.agents_md_path,
-                "referenced_files_count": len(context_result.referenced_files),
-                "directory_structure_available": bool(
-                    context_result.directory_structure
-                ),
-            },
-        )
-
-        # ===== Phase 3: Security check on extracted context =====
-        print(f"{CLI_YELLOW}[3/5] Security check on context...{CLI_CLR}")
-        context_content = context_result.agents_md_content
-        for path, content in context_result.referenced_files.items():
-            context_content += f"\n\n--- {path} ---\n{content}"
-
-        context_security = self.security_gate.check_context(context_content)
-        if context_security.injection_detected:
-            print(
-                f"{CLI_YELLOW}Hidden instructions in context: {context_security.injection_type}{CLI_CLR}"
-            )
-
-        self.trace_logger.log_agent_event(
-            agent_name="security_gate",
-            event="context_check",
-            details={
-                "allowed": context_security.allowed,
-                "injection_detected": context_security.injection_detected,
-                "injection_type": context_security.injection_type,
-            },
-        )
-
-        # ===== Phase 4: Build task context =====
-        print(f"{CLI_YELLOW}[4/5] Building task context...{CLI_CLR}")
-        task_context = self.context_extractor.to_task_context(
-            context_result=context_result,
-            task_text=task_text,
-        )
-        print(f"{CLI_GREEN}Task context built{CLI_CLR}")
-
-        # ===== Phase 5: Execute task =====
-        print(f"{CLI_YELLOW}[5/5] Executing task...{CLI_CLR}")
-
+        # Initialize VM client
         vm = PcmRuntimeClientSync(harness_url)
-        conversation_log = []
+
+        # =====================================================================
+        # Step 1: Initialize AgentState
+        # =====================================================================
+        state: AgentState = {
+            "task_text": task_text,
+            "triage_result": None,
+            "workspace_rules": {},
+            "scratchpad": ScratchpadState(),
+            "conversation_history": [],
+            "is_completed": False,
+            "final_outcome": "",
+        }
+
+        # =====================================================================
+        # Step 2: Triage (1 LLM call)
+        # =====================================================================
+        print(f"{CLI_YELLOW}[1/3] Triage — classifying request...{CLI_CLR}", flush=True)
+        state = run_triage(state, self.provider, self.trace_logger)
+
+        if state["is_completed"]:
+            outcome = state["final_outcome"]
+            reason = state["triage_result"].reason if state["triage_result"] else "Unknown"
+            print(f"{CLI_RED}TRIAGE BLOCKED: {outcome} — {reason}{CLI_CLR}")
+
+            # Send answer to PCM
+            try:
+                send_answer(vm, f"Request blocked by triage: {reason}", outcome)
+            except Exception as e:
+                print(f"Failed to submit triage block to VM: {e}")
+
+            return self._build_result(state, task_id, start_time, 0)
+
+        triage_info = state["triage_result"]
+        print(f"{CLI_GREEN}Triage passed: {triage_info.intent.value} — {triage_info.reason}{CLI_CLR}")
+
+        # =====================================================================
+        # Step 3: Bootstrap (0 LLM calls)
+        # =====================================================================
+        print(f"{CLI_YELLOW}[2/3] Bootstrap — loading workspace rules...{CLI_CLR}")
+        state = run_bootstrap(state, vm, self.trace_logger)
+
+        rules_count = len(state["workspace_rules"])
+        print(f"{CLI_GREEN}Loaded {rules_count} rule files{CLI_CLR}")
+        for path in state["workspace_rules"]:
+            print(f"  📄 {path}")
+
+        # =====================================================================
+        # Step 4: Execution Loop
+        # =====================================================================
+        print(f"{CLI_YELLOW}[3/3] Execution loop (max {max_iterations} steps)...{CLI_CLR}")
+
+        tool_calls_log = []
         iteration = 0
+        final_answer = ""
+        grounding_refs = []
+        completed_steps = []
 
         for iteration in range(max_iterations):
-            iteration_name = f"step_{iteration + 1}"
-            print(f"\n{CLI_YELLOW}--- {iteration_name} ---{CLI_CLR}")
+            step_name = f"step_{iteration + 1}"
+            print(f"\n{CLI_YELLOW}--- {step_name} ---{CLI_CLR}")
 
-            # Get next step from execution agent
-            next_step, is_complete = self.execution_agent.execute(
-                task_text=task_text,
-                context=task_context,
-                conversation_log=conversation_log,
-            )
+            # 4a. Plan next step
+            prompt = build_planner_prompt(state)
 
-            # Check for completion BEFORE breaking - extract answer data
+            try:
+                next_step = plan_next_step(
+                    prompt=prompt,
+                    conversation_history=state["conversation_history"],
+                    llm_provider=self.provider,
+                    trace_logger=self.trace_logger,
+                    step_name=step_name,
+                )
+            except Exception as e:
+                print(f"{CLI_RED}LLM error: {e}{CLI_CLR}")
+                state["final_outcome"] = "OUTCOME_ERR_INTERNAL"
+                state["is_completed"] = True
+                final_answer = f"LLM error: {e}"
+                break
+
+            # 4b. Update Scratchpad from LLM response
+            state["scratchpad"] = next_step.scratchpad_update
+
+            print(f"  📝 Goal: {next_step.scratchpad_update.current_goal[:100]}")
+            print(f"  📋 Plan: {next_step.plan_remaining_steps_brief[0]}")
+
+            # 4c. Check for completion
             if isinstance(next_step.function, ReportTaskCompletion):
                 final_answer = next_step.function.message
                 grounding_refs = next_step.function.grounding_refs
                 completed_steps = next_step.function.completed_steps_laconic
-                outcome = next_step.function.outcome
+                state["final_outcome"] = next_step.function.outcome
+                state["is_completed"] = True
 
-                status = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
-                print(f"{status}TASK COMPLETED: {outcome}{CLI_CLR}")
+                status = CLI_GREEN if next_step.function.outcome == "OUTCOME_OK" else CLI_YELLOW
+                print(f"{status}TASK COMPLETED: {next_step.function.outcome}{CLI_CLR}")
                 print(f"Summary: {final_answer}")
                 if grounding_refs:
                     print(f"References: {', '.join(grounding_refs)}")
                 break
 
-            if is_complete:
-                break
-
-            tool_name = next_step.function.__class__.__name__
+            # 4d. Execute tool
+            tool_name = next_step.function.tool
             tool_args = next_step.function.model_dump()
+            # Remove 'tool' key from args since it's the tool name
+            tool_args.pop("tool", None)
 
-            # Security check on tool call
-            tool_security = self.security_gate.check_tool_call(
-                tool_name=tool_name,
-                arguments=tool_args,
+            tool_call = {"name": tool_name, "arguments": tool_args}
+
+            print(f"  🔧 {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}")
+
+            result_text = execute_tool(
+                tool_call=tool_call,
+                vm_client=vm,
+                trace_logger=self.trace_logger,
+                step_name=step_name,
             )
 
-            if not tool_security.allowed:
-                print(f"{CLI_RED}TOOL BLOCKED: {tool_security.reason}{CLI_CLR}")
-                conversation_log.append(
+            print(f"{CLI_GREEN}OUT{CLI_CLR}: {result_text[:200]}...")
+
+            # Track tool call for results
+            tool_calls_log.append({
+                "iteration": step_name,
+                "tool_name": tool_name,
+                "arguments": tool_args,
+                "result": result_text[:200],
+            })
+
+            # Add to conversation history
+            state["conversation_history"].append({
+                "role": "assistant",
+                "content": next_step.plan_remaining_steps_brief[0],
+                "tool_calls": [
                     {
-                        "role": "assistant",
-                        "content": next_step.plan_remaining_steps_brief[0]
-                        if next_step.plan_remaining_steps_brief
-                        else "",
-                        "tool_calls": [
-                            {
-                                "type": "function",
-                                "id": iteration_name,
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": next_step.function.model_dump_json(),
-                                },
-                            }
-                        ],
+                        "type": "function",
+                        "id": step_name,
+                        "function": {
+                            "name": tool_name,
+                            "arguments": next_step.function.model_dump_json(),
+                        },
                     }
-                )
-                conversation_log.append(
-                    {
-                        "role": "tool",
-                        "content": f"BLOCKED BY SECURITY: {tool_security.reason}",
-                        "tool_call_id": iteration_name,
-                    }
-                )
-                continue
+                ],
+            })
+            state["conversation_history"].append({
+                "role": "tool",
+                "content": result_text,
+                "tool_call_id": step_name,
+            })
 
-            print(f"  -> {tool_name}: {tool_args}")
+        # Handle timeout
+        if not state["is_completed"]:
+            state["final_outcome"] = "OUTCOME_ERR_INTERNAL"
+            final_answer = f"Task did not complete within {max_iterations} iterations."
+            print(f"{CLI_RED}TIMEOUT: {final_answer}{CLI_CLR}")
 
-            # Add to conversation
-            conversation_log.append(
-                {
-                    "role": "assistant",
-                    "content": next_step.plan_remaining_steps_brief[0]
-                    if next_step.plan_remaining_steps_brief
-                    else "",
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "id": iteration_name,
-                            "function": {
-                                "name": tool_name,
-                                "arguments": json.dumps(tool_args),
-                            },
-                        }
-                    ],
-                }
+        # =====================================================================
+        # Step 5: Send AnswerRequest to PCM (ONLY here!)
+        # =====================================================================
+        try:
+            send_answer(
+                vm=vm,
+                message=final_answer,
+                outcome=state["final_outcome"],
+                refs=grounding_refs,
             )
+            print(f"{CLI_GREEN}Answer sent to PCM: {state['final_outcome']}{CLI_CLR}")
+        except Exception as e:
+            print(f"{CLI_RED}Failed to send answer to PCM: {e}{CLI_CLR}")
 
-            # Execute tool
-            result_output = ""
-            try:
-                result = dispatch_pac1(vm, next_step.function)
-                if result is None:
-                    result_output = '{"error": "Operation blocked"}'
-                else:
-                    result_dict = MessageToDict(result)
-                    result_output = json.dumps(result_dict, indent=2)
-            except ConnectError as e:
-                result_output = str(e.message)
-            except Exception as e:
-                result_output = str(e)
-
-            print(f"{CLI_GREEN}OUT{CLI_CLR}: {result_output[:200]}...")
-
-            # Track tool call
-            tool_calls.append(
-                {
-                    "iteration": iteration_name,
-                    "tool_name": tool_name,
-                    "arguments": tool_args,
-                    "result": result_output[:200],
-                }
-            )
-
-            conversation_log.append(
-                {
-                    "role": "tool",
-                    "content": result_output,
-                    "tool_call_id": iteration_name,
-                }
-            )
-
-        # Log final result
+        # =====================================================================
+        # Step 6: Log results
+        # =====================================================================
         duration = time.time() - start_time
         self.trace_logger.log_agent_event(
             agent_name="orchestrator",
             event="task_complete",
             details={
-                "outcome": outcome,
+                "outcome": state["final_outcome"],
                 "duration_seconds": duration,
                 "iterations_used": iteration + 1,
-                "tool_calls_count": len(tool_calls),
+                "tool_calls_count": len(tool_calls_log),
+                "rules_loaded": len(state["workspace_rules"]),
+                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
             },
         )
 
         return {
             "task_id": task_id,
             "status": "completed" if final_answer else "incomplete",
-            "outcome": outcome,
+            "outcome": state["final_outcome"],
             "final_answer": final_answer,
             "grounding_refs": grounding_refs,
             "completed_steps": completed_steps,
-            "tool_calls": tool_calls,
+            "tool_calls": tool_calls_log,
             "iterations_used": iteration + 1,
             "duration_seconds": duration,
             "context": {
-                "agents_md_path": context_result.agents_md_path,
-                "referenced_files_count": len(context_result.referenced_files),
-                "instruction_graph_nodes": len(
-                    context_result.instruction_dependency_graph.nodes
-                )
-                if context_result.instruction_dependency_graph
-                else 0,
+                "rules_loaded": len(state["workspace_rules"]),
+                "rule_paths": list(state["workspace_rules"].keys()),
+                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
             },
         }
 
-    def _create_error_result(
-        self, task_id: str, status: str, reason: str
+    def _build_result(
+        self,
+        state: AgentState,
+        task_id: str,
+        start_time: float,
+        iterations: int,
     ) -> Dict[str, Any]:
-        """Create error result."""
+        """Build result dict for early exits (triage blocks, etc.)."""
+        duration = time.time() - start_time
+        reason = state["triage_result"].reason if state["triage_result"] else "Unknown"
+
+        self.trace_logger.log_agent_event(
+            agent_name="orchestrator",
+            event="task_complete",
+            details={
+                "outcome": state["final_outcome"],
+                "duration_seconds": duration,
+                "iterations_used": iterations,
+                "early_exit": True,
+                "reason": reason,
+            },
+        )
+
         return {
             "task_id": task_id,
-            "status": status,
-            "outcome": "OUTCOME_ERR_INTERNAL",
-            "final_answer": f"Error: {reason}",
+            "status": "blocked",
+            "outcome": state["final_outcome"],
+            "final_answer": f"Blocked: {reason}",
             "grounding_refs": [],
             "completed_steps": [],
             "tool_calls": [],
-            "iterations_used": 0,
-            "duration_seconds": 0,
-            "context": {},
+            "iterations_used": iterations,
+            "duration_seconds": duration,
+            "context": {
+                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
+            },
         }
-
-
-def create_orchestrator(provider=None, system_prompt: str = None) -> Orchestrator:
-    """Create an orchestrator instance."""
-    return Orchestrator(provider=provider, system_prompt=system_prompt)
