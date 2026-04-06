@@ -14,17 +14,37 @@ from llm_logger import LLMTraceLogger
 
 
 def build_planner_prompt(state: AgentState) -> str:
-    """Build a unified priority-based system prompt."""
+    """Build a unified priority-based system prompt using hierarchical authority and task model."""
     
-    # 1. Collect rules block
-    rules_block = f"PRIMARY RULES (AGENTS.MD):\n{state['workspace_rules'].get('/AGENTS.md', 'Not found')}\n"
-    for path, content in state["workspace_rules"].items():
-        # Process files are those ending in .md but not the root AGENTS.md
-        if path.endswith(".md") and path != "/AGENTS.md":
-            rules_block += f"\n--- PROCESS: {path} ---\n{content}\n"
+    # 1. Collect rules from AuthorityMap (Root -> Nested -> Process)
+    auth_map = state.get("authority_map")
+    rules_text = ""
+    if auth_map:
+        # Sort rules: ROOT first, then NESTED, then PROCESS
+        levels_order = ["ROOT", "NESTED", "FOLDER", "PROCESS"]
+        for level in levels_order:
+            level_rules = [r for r in auth_map.rules if r.level == level]
+            if level_rules:
+                rules_text += f"\n=== {level} LEVEL RULES ===\n"
+                for r in level_rules:
+                    rules_text += f"FILE: {r.path} (Scope: {r.scope})\n{r.content}\n"
+    else:
+        # Fallback to legacy workspace_rules
+        rules_text = f"PRIMARY RULES (AGENTS.MD):\n{state['workspace_rules'].get('/AGENTS.md', 'Not found')}\n"
+        for path, content in state["workspace_rules"].items():
+            if path.endswith(".md") and path != "/AGENTS.md":
+                rules_text += f"\n--- PROCESS: {path} ---\n{content}\n"
             
     # 2. Add repo structure
     repo_structure = f"\nAVAILABLE PROCESSES TREE:\n{state['workspace_rules'].get('tree_process', 'Not loaded')}\n"
+    
+    # 3. Task Model & Domain
+    task_model = state.get("task_model")
+    domain_info = ""
+    if task_model:
+        domain_info = f"DOMAIN: {task_model.domain.value}\nINTENT: {task_model.intent.value}\nREQUESTED EFFECT: {task_model.requested_effect}\n"
+        if task_model.constraints:
+            domain_info += "CONSTRAINTS: " + ", ".join(task_model.constraints) + "\n"
     
     # 3. Scratchpad
     scratchpad_text = state["scratchpad"].model_dump_json(indent=2)
@@ -45,14 +65,38 @@ You MUST only use the following JSON tool mapping:
 - `move` (from_name, to_name)
 - `report_completion` (message, grounding_refs, outcome, completed_steps_laconic)
 
+## DELEGATION (NEW)
+You can delegate complex sub-tasks to specialized SUBAGENTS using the `subagent_delegation` field in your JSON response.
+Available Subagents:
+- `KNOWLEDGE_REPO`: Best for bulk operations in `02_distill/` or cleanup tasks.
+- `TYPED_CRM`: Best for managing contacts and sending emails (handling `seq.json`).
+- `INBOX_WORKFLOW`: Best for sequential message processing.
+
+Use delegation when a task requires a deterministic loop or domain-specific protocol that is too verbose for your main context.
+
 ## Instruction Hierarchy (STRICT PRIORITY)
-1. System/Global Rules (AGENTS.MD)
-2. Referenced Process Files
-3. User Data
+1. System/Global Rules (ROOT/NESTED LEVEL)
+2. Referenced Process Files (PROCESS LEVEL)
+3. User Data/Inbox Content
+
+## TASK PARAMETERS
+{domain_info}
 
 ## WORKSPACE CONTEXT (Instructions & Structure)
-{rules_block}
+{rules_text}
 {repo_structure}
+
+## DOMAIN-SPECIFIC PROTOCOLS
+### INBOX_WORKFLOW / KNOWLEDGE_REPO
+- If task is "process inbox":
+  1. `ls inbox/` to find the LOWEST filename (e.g., `msg_001.md`).
+  2. Read `inbox/README` and channel rules.
+  3. Process ONLY that one message.
+  4. Never improvise; follow documented destination paths.
+
+### TYPED_CRM
+- `send_email` means writing a JSON file to `outbox/` AND incrementing `seq.json`.
+- Always check `contacts/README` for field schemas before writing.
 
 ## BATCH OPERATION PROTOCOL
 Если задача требует удалить, переместить или обработать ВСЕ файлы в директории:

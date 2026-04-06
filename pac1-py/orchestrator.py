@@ -23,10 +23,15 @@ from agents.types import (
     AgentState,
     ScratchpadState,
     ReportTaskCompletion,
+    AuthorityMap,
     get_outcome_map,
 )
 from agents.triage_node import run_triage
 from agents.bootstrap_node import run_bootstrap
+from agents.task_node import run_task_extraction
+from agents.security_node import run_post_context_security
+from agents.validator_node import run_post_mutation_validation
+from agents.subagent_node import run_subagent_session
 from agents.execution_agent import build_planner_prompt, plan_next_step
 from agents.tool_executor import execute_tool
 from agents.pcm_helpers import send_answer
@@ -38,6 +43,7 @@ CLI_GREEN = "\x1b[32m"
 CLI_CLR = "\x1b[0m"
 CLI_YELLOW = "\x1b[33m"
 CLI_BLUE = "\x1b[34m"
+CLI_CYAN = "\x1b[36m"
 
 
 class Orchestrator:
@@ -85,7 +91,9 @@ class Orchestrator:
         state: AgentState = {
             "task_text": task_text,
             "triage_result": None,
+            "task_model": None,
             "workspace_rules": {},
+            "authority_map": AuthorityMap(),
             "scratchpad": ScratchpadState(),
             "conversation_history": [],
             "is_completed": False,
@@ -123,12 +131,38 @@ class Orchestrator:
         rules_count = len(state["workspace_rules"])
         print(f"{CLI_GREEN}Loaded {rules_count} rule files{CLI_CLR}")
         for path in state["workspace_rules"]:
-            print(f"  📄 {path}")
+            print(f"  [Rule] {path}")
 
         # =====================================================================
-        # Step 4: Execution Loop
+        # Step 4: Structured Task Extraction (1 LLM call)
         # =====================================================================
-        print(f"{CLI_YELLOW}[3/3] Execution loop (max {max_iterations} steps)...{CLI_CLR}")
+        print(f"{CLI_YELLOW}[3/4] Task Model — extracting structure...{CLI_CLR}")
+        state = run_task_extraction(state, self.provider, self.trace_logger)
+
+        model = state["task_model"]
+        print(f"{CLI_GREEN}Task Model Ready: {model.domain.value} - {model.requested_effect}{CLI_CLR}")
+
+        # =====================================================================
+        # Step 5: Decision Gate (Ambiguity & Security)
+        # =====================================================================
+        if model.ambiguity_high and model.intent in ("MUTATION", "SECURITY_DENIAL"):
+            print(f"{CLI_RED}DECISION GATE: STOP — High Ambiguity for Mutation{CLI_CLR}")
+            state["final_outcome"] = "OUTCOME_NONE_CLARIFICATION"
+            state["is_completed"] = True
+            send_answer(vm, f"Request is too ambiguous for action: {model.requested_effect}", state["final_outcome"])
+            return self._build_result(state, task_id, start_time, 0)
+
+        if model.security_risk_high and model.intent == "SECURITY_DENIAL":
+            print(f"{CLI_RED}DECISION GATE: STOP — High Security Risk Denial{CLI_CLR}")
+            state["final_outcome"] = "OUTCOME_DENIED_SECURITY"
+            state["is_completed"] = True
+            send_answer(vm, f"Request denied for security reasons: {model.requested_effect}", state["final_outcome"])
+            return self._build_result(state, task_id, start_time, 0)
+
+        # =====================================================================
+        # Step 6: Execution Loop
+        # =====================================================================
+        print(f"{CLI_YELLOW}[4/4] Execution loop (max {max_iterations} steps)...{CLI_CLR}")
 
         tool_calls_log = []
         iteration = 0
@@ -179,24 +213,71 @@ class Orchestrator:
                     print(f"References: {', '.join(grounding_refs)}")
                 break
 
-            # 4d. Execute tool
-            tool_name = next_step.function.tool
-            tool_args = next_step.function.model_dump()
-            # Remove 'tool' key from args since it's the tool name
-            tool_args.pop("tool", None)
+            # 4c. Delegate to Subagent (NEW)
+            if next_step.subagent_delegation:
+                task = next_step.subagent_delegation
+                print(f"{CLI_CYAN}  -> Delegating to SUBAGENT: {task.subagent_id}{CLI_CLR}")
+                print(f"{CLI_CYAN}     Instruction: {task.instruction}{CLI_CLR}")
+                
+                sub_result = run_subagent_session(
+                    domain=task.subagent_id,
+                    task=task,
+                    state=state,
+                    llm_provider=self.provider,
+                    vm_client=vm,
+                    trace_logger=self.trace_logger
+                )
+                
+                # Feedback sub-result to Planner in the next iteration
+                status_str = "SUCCESS" if sub_result.success else "FAILED"
+                result_text = f"[SUBAGENT {task.subagent_id} RESULT - {status_str}]: {sub_result.message}"
+                if sub_result.grounding_refs:
+                    result_text += f"\nRefs: {', '.join(sub_result.grounding_refs)}"
+                
+                print(f"{CLI_CYAN}  <- Subagent returned: {status_str}{CLI_CLR}")
+                
+                # Skip normal tool execution since subagent handled it
+                tool_name = f"subagent_{task.subagent_id}"
+                tool_args = task.model_dump()
+            else:
+                # 4d. Execute tool
+                tool_name = next_step.function.tool
+                tool_args = next_step.function.model_dump()
+                # Remove 'tool' key from args since it's the tool name
+                tool_args.pop("tool", None)
 
-            tool_call = {"name": tool_name, "arguments": tool_args}
+                tool_call = {"name": tool_name, "arguments": tool_args}
 
-            print(f"  🔧 {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}")
+                print(f"  (Tool) {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}")
 
-            result_text = execute_tool(
-                tool_call=tool_call,
-                vm_client=vm,
-                trace_logger=self.trace_logger,
-                step_name=step_name,
-            )
+                result_text = execute_tool(
+                    tool_call=tool_call,
+                    vm_client=vm,
+                    trace_logger=self.trace_logger,
+                    step_name=step_name,
+                )
 
             print(f"{CLI_GREEN}OUT{CLI_CLR}: {result_text[:200]}...")
+
+            # ----- Step 4e: Post-context Security Guard -----
+            if tool_name in ("read", "cat") and len(result_text) > 50:
+                print(f"{CLI_YELLOW}  [Security] check on content...{CLI_CLR}")
+                security_check = run_post_context_security(result_text, self.provider, self.trace_logger)
+                if not security_check.allowed:
+                    print(f"{CLI_RED}SECURITY BLOCK: Content detected as injection!{CLI_CLR}")
+                    state["final_outcome"] = "OUTCOME_DENIED_SECURITY"
+                    state["is_completed"] = True
+                    final_answer = f"Security block: {security_check.reason}"
+                    break
+
+            # ----- Step 4f: Post-mutation Invariant Validation -----
+            if tool_name in ("write", "delete", "move", "mkdir"):
+                print(f"{CLI_YELLOW}  [Validation] mutation invariants...{CLI_CLR}")
+                warnings = run_post_mutation_validation(state, vm, tool_call, self.trace_logger)
+                if warnings:
+                    print(f"{CLI_YELLOW}VALIDATION WARNING: {warnings[0]}{CLI_CLR}")
+                    # Add as feedback to the next step
+                    result_text += "\n\n[VALIDATION FEEDBACK]: " + "\n".join(warnings)
 
             # Track tool call for results
             tool_calls_log.append({
