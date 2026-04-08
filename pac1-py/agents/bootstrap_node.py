@@ -123,25 +123,44 @@ def run_bootstrap(
             ))
 
     # --- Step 3: Domain-Conditioned Discovery ---
+    # Load READMEs for all relevant folders + processing docs
     domain_discovery_paths = []
-    if domain in (DomainType.KNOWLEDGE_REPO, DomainType.INBOX_WORKFLOW):
+    if domain in (DomainType.KNOWLEDGE_REPO,):
         domain_discovery_paths = [
-            "00_inbox/README.md", 
+            "00_inbox/README.md",
             "01_capture/README.md",
+            "02_distill/README.md",
             "99_process/README.md",
-            "inbox/README.md"
+        ]
+    elif domain == DomainType.INBOX_WORKFLOW:
+        domain_discovery_paths = [
+            "inbox/README.md",
+            "docs/inbox-msg-processing.md",
+            "docs/inbox-task-processing.md",
+            "docs/channels/AGENTS.MD",
+            "docs/channels/Discord.txt",
+            "docs/channels/Telegram.txt",
+            # Note: otp.txt intentionally NOT pre-loaded (sensitive)
+            "contacts/README.md",
+            "accounts/README.md",
+            "outbox/README.md",
+            "my-invoices/README.MD",
+            "reminders/README.MD",
         ]
     elif domain == DomainType.TYPED_CRM:
         domain_discovery_paths = [
             "contacts/README.md",
             "accounts/README.md",
             "outbox/README.md",
-            "invoices/README.md"
+            "my-invoices/README.MD",
+            "reminders/README.MD",
+            "opportunities/README.MD",
+            "01_notes/README.MD",
         ]
     elif domain == DomainType.REPAIR_DIAGNOSTICS:
         domain_discovery_paths = [
             "docs/repair/README.md",
-            "config/README.md"
+            "config/README.md",
         ]
 
     for path in domain_discovery_paths:
@@ -178,13 +197,18 @@ def run_bootstrap(
                 scope=scope
             ))
 
-    # --- Step 5: tree_process Legacy Support ---
+    # --- Step 5: Full repo tree for orientation ---
     try:
-        tree_result = vm_client.tree(TreeRequest(root="/99_process/", level=2))
-        formatted_tree = format_tree({"root": "/99_process/", "level": 2}, tree_result)
+        tree_result = vm_client.tree(TreeRequest(root="/", level=2))
+        formatted_tree = format_tree({"root": "/", "level": 2}, tree_result)
         rules["tree_process"] = formatted_tree
     except:
-        rules["tree_process"] = "Failed to load /99_process/ tree"
+        try:
+            tree_result = vm_client.tree(TreeRequest(root="/99_process/", level=2))
+            formatted_tree = format_tree({"root": "/99_process/", "level": 2}, tree_result)
+            rules["tree_process"] = formatted_tree
+        except:
+            rules["tree_process"] = "Failed to load tree"
 
     state["workspace_rules"] = rules
     state["authority_map"] = auth_map

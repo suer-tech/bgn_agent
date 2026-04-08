@@ -45,7 +45,7 @@ def run_post_mutation_validation(
             is_relevant = True
         if domain == DomainType.TYPED_CRM and any(p in target_path for p in ("contacts", "accounts", "outbox", "invoices")):
             is_relevant = True
-        if domain == DomainType.KNOWLEDGE_REPO and any(p in target_path for p in ("00_inbox", "01_capture", "90_memory", "99_process")):
+        if domain in (DomainType.KNOWLEDGE_REPO, DomainType.INBOX_WORKFLOW) and any(p in target_path for p in ("00_inbox", "01_capture", "02_distill", "90_memory", "99_process")):
             is_relevant = True
             
         if not is_relevant and "AGENTS.md" not in target_path:

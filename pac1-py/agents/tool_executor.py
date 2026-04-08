@@ -65,9 +65,11 @@ def execute_tool(
     if name in WRITE_TOOLS:
         target_path = args.get("path", "") or args.get("to_name", "")
 
-        # Check exact matches
+        # Check exact matches or folder-relative matches
+        target_path_lower = target_path.lower().replace("\\", "/")
         for ro_path in READ_ONLY_PATHS:
-            if ro_path.lower() in target_path.lower():
+            ro_path_lower = ro_path.lower().lstrip("/")
+            if target_path_lower == ro_path_lower or target_path_lower.endswith("/" + ro_path_lower):
                 result = f"SECURITY BLOCK: File is read-only: {target_path}"
                 _log_tool_event(trace_logger, step_name, name, args, result, False, start_time)
                 return result

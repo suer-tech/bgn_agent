@@ -178,6 +178,7 @@ class AgentState(TypedDict):
     workspace_rules: Dict[str, str]               # Legacy: flat rules for backward compatibility
     authority_map: AuthorityMap                   # New: hierarchical rules
     scratchpad: ScratchpadState                    # Оперативная память агента
+    entity_context: str                           # Pre-gathered context for target entities
     conversation_history: List[dict]               # Лог LLM-вызовов
     is_completed: bool                             # Флаг завершения цикла
     final_outcome: str                             # OUTCOME_OK, OUTCOME_DENIED_SECURITY и т.д.
@@ -297,7 +298,7 @@ class SubagentResult(BaseModel):
 
 class NextStep(BaseModel):
     current_state: str
-    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(5)] = Field(
+    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(8)] = Field(
         ...,
         description="briefly explain the next useful steps",
     )
