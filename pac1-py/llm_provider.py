@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import time
 from typing import Any, Dict, List, Type, TypeVar
 
 from openai import OpenAI
@@ -12,10 +13,10 @@ T = TypeVar("T", bound=BaseModel)
 
 # ANSI colors
 CLI_RED = "\x1b[31m"
-CLI_YELLOW = "\x1B[33m"
-CLI_GREEN = "\x1B[32m"
+CLI_YELLOW = "\x1b[33m"
+CLI_GREEN = "\x1b[32m"
 CLI_CYAN = "\x1b[36m"
-CLI_CLR = "\x1B[0m"
+CLI_CLR = "\x1b[0m"
 CLI_DIM = "\x1b[90m"
 
 
@@ -78,7 +79,7 @@ class LLMProvider:
                     if check_text.endswith("```"):
                         check_text = check_text[:-3]
                     check_text = check_text.strip()
-            
+
             json_start = -1
             for char in ["{", "["]:
                 pos = check_text.find(char)
@@ -133,16 +134,80 @@ class OpenRouterProvider(LLMProvider):
         return self.complete_as(messages, NextStep)
 
     def complete_as(self, messages: List[Dict[str, Any]], response_type: Type[T]) -> T:
-        resp = self.client.beta.chat.completions.parse(
-            model=self.model,
-            response_format=response_type,
-            messages=messages,
-            max_completion_tokens=16384,
-        )
-        parsed = resp.choices[0].message.parsed
-        if parsed is None:
-            raise ValueError(f"LLM returned None for {response_type.__name__}")
-        return parsed
+        schema_hint = build_schema_hint_for_type(response_type)
+        messages_with_schema = messages + [{"role": "system", "content": schema_hint}]
+
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages_with_schema,
+                    max_tokens=16384,
+                )
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate" in err_str.lower():
+                    wait = min(30 * (2**attempt), 300)
+                    print(
+                        f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Rate limited, waiting {wait}s...{CLI_CLR}",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+            error = getattr(resp, "error", None)
+            if error:
+                err_msg = str(error)
+                if "429" in err_msg or "rate" in err_msg.lower():
+                    wait = min(30 * (2**attempt), 300)
+                    print(
+                        f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Rate limited (error field), waiting {wait}s...{CLI_CLR}",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise ValueError(f"LLM returned error: {error}")
+
+            if resp.choices is None or len(resp.choices) == 0:
+                wait = min(30 * (2**attempt), 300)
+                print(
+                    f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Empty choices, waiting {wait}s...{CLI_CLR}",
+                    flush=True,
+                )
+                time.sleep(wait)
+                continue
+
+            choice = resp.choices[0].message
+            text = choice.content
+
+            if text is None:
+                tool_calls = getattr(choice, "tool_calls", None)
+                if tool_calls:
+                    text = tool_calls[0].function.arguments
+                else:
+                    reasoning = getattr(choice, "reasoning", None)
+                    if reasoning:
+                        text = reasoning
+                    else:
+                        raise ValueError(
+                            f"LLM returned None content. Full choice: {choice}"
+                        )
+
+            print(
+                f"{CLI_DIM}Raw LLM text ({len(text)} chars): {text[:300]}...{CLI_CLR}",
+                flush=True,
+            )
+            json_text = self._extract_json(text)
+            print(
+                f"{CLI_DIM}Extracted JSON ({len(json_text)} chars): {json_text[:300]}...{CLI_CLR}",
+                flush=True,
+            )
+            data = json.loads(json_text)
+            return response_type.model_validate(data)
+
+        raise ValueError(f"LLM rate limited after {max_retries} retries")
 
 
 class AntigravityProvider(LLMProvider):
@@ -151,26 +216,33 @@ class AntigravityProvider(LLMProvider):
 
     def complete_as(self, messages: List[Dict[str, Any]], response_type: Type[T]) -> T:
         import json, os, time
-        req_file = '.llm_request.json'
-        res_file = '.llm_response.json'
-        
+
+        req_file = ".llm_request.json"
+        res_file = ".llm_response.json"
+
         # 1. Clean up old files to ensure we don't read stale data
         if os.path.exists(req_file):
             os.remove(req_file)
         if os.path.exists(res_file):
             os.remove(res_file)
-            
+
         # 2. Write new request
-        print(f"\x1b[33m[Antigravity] Writing messages to {req_file}... (Size: {len(str(messages))} chars)\x1b[0m", flush=True)
-        with open(req_file, 'w', encoding='utf-8') as f:
+        print(
+            f"\x1b[33m[Antigravity] Writing messages to {req_file}... (Size: {len(str(messages))} chars)\x1b[0m",
+            flush=True,
+        )
+        with open(req_file, "w", encoding="utf-8") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
-            
-        print(f"\x1b[33m[Antigravity] Prompt written. Waiting for {res_file}... Go to that file and provide JSON response.\x1b[0m", flush=True)
-        
+
+        print(
+            f"\x1b[33m[Antigravity] Prompt written. Waiting for {res_file}... Go to that file and provide JSON response.\x1b[0m",
+            flush=True,
+        )
+
         # 3. Wait for response file to be created
         while not os.path.exists(res_file):
             time.sleep(1)
-            
+
         # 4. Wait a bit more to ensure file write is finished and try to parse
         MAX_RETRIES = 5
         data = None
@@ -179,7 +251,7 @@ class AntigravityProvider(LLMProvider):
                 time.sleep(0.5)
                 if not os.path.exists(res_file):
                     continue
-                with open(res_file, 'r', encoding='utf-8') as f:
+                with open(res_file, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                     if not content:
                         continue
@@ -189,22 +261,108 @@ class AntigravityProvider(LLMProvider):
                 if i == MAX_RETRIES - 1:
                     print(f"Final attempt to parse JSON failed: {e}")
                     raise
-                print(f"Attempt {i+1} to parse {res_file} failed, retrying...")
-                    
+                print(f"Attempt {i + 1} to parse {res_file} failed, retrying...")
+
         # 5. Clean up and return
         if os.path.exists(res_file):
             os.remove(res_file)
         if data is None:
             raise ValueError(f"Failed to read valid JSON from {res_file}")
-            
+
         # Robust parsing for human-provided JSON (might have markdown)
         if isinstance(data, str):
             data = json.loads(self._extract_json(data))
         elif isinstance(data, dict):
             # Already a dict, good
             pass
-            
+
         return response_type.model_validate(data)
+
+
+class ClaudeCodeProvider(LLMProvider):
+    """Provider that calls the claude CLI (Claude Code) as a subprocess.
+
+    Uses the user's existing Claude Max/Pro subscription — no separate API key needed.
+    Invokes `claude -p` with JSON output and parses the result.
+    """
+
+    def __init__(self, model: str = ""):
+        self.model = model
+        print(f"{CLI_GREEN}Using Claude Code provider (claude CLI){CLI_CLR}")
+
+    def complete(self, messages: List[Dict[str, Any]]) -> NextStep:
+        return self.complete_as(messages, NextStep)
+
+    def complete_as(self, messages: List[Dict[str, Any]], response_type: Type[T]) -> T:
+        full_prompt = messages_to_prompt(messages)
+        schema_hint = build_schema_hint_for_type(response_type)
+        full_prompt = full_prompt + "\n\n=== RESPONSE FORMAT ===\n" + schema_hint
+
+        print(f"{CLI_DIM}Calling claude CLI ({len(full_prompt)} chars)...{CLI_CLR}")
+
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--tools", "",
+            "--system-prompt", "You are a pure JSON generator. Read the prompt and respond ONLY with a valid JSON object matching the requested schema. No commentary, no markdown fences, no explanation.",
+        ]
+        if self.model:
+            cmd.extend(["--model", self.model])
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=full_prompt.encode("utf-8"),
+                    capture_output=True,
+                    timeout=300,
+                )
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                stderr = result.stderr.decode("utf-8", errors="replace")
+
+                if result.returncode != 0:
+                    print(f"{CLI_RED}claude CLI error (rc={result.returncode}): {stderr[:500]}{CLI_CLR}")
+                    if attempt < max_retries - 1:
+                        wait = 5 * (attempt + 1)
+                        print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Waiting {wait}s...{CLI_CLR}")
+                        time.sleep(wait)
+                        continue
+                    raise ValueError(f"claude CLI failed: {stderr[:500]}")
+
+                # Parse the JSON envelope from claude CLI
+                try:
+                    envelope = json.loads(stdout)
+                    text_response = envelope.get("result", "")
+                except json.JSONDecodeError:
+                    # Fallback: treat stdout as raw text
+                    text_response = stdout
+
+                if not text_response:
+                    raise ValueError("Empty response from claude CLI")
+
+                print(
+                    f"{CLI_DIM}Claude response ({len(text_response)} chars): {text_response[:300]}...{CLI_CLR}",
+                    flush=True,
+                )
+
+                json_text = self._extract_json(text_response)
+                data = json.loads(json_text)
+                return response_type.model_validate(data)
+
+            except subprocess.TimeoutExpired:
+                if attempt < max_retries - 1:
+                    print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Timeout, retrying...{CLI_CLR}")
+                    continue
+                raise ValueError("claude CLI timed out after 300 seconds")
+            except (json.JSONDecodeError, Exception) as e:
+                if attempt < max_retries - 1 and "timed out" not in str(e):
+                    print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Error: {e}, retrying...{CLI_CLR}")
+                    time.sleep(3)
+                    continue
+                raise
+
+        raise ValueError(f"claude CLI failed after {max_retries} retries")
 
 
 class OpencodeProvider(LLMProvider):
@@ -321,9 +479,12 @@ def create_provider() -> LLMProvider:
     elif provider_name == "antigravity":
         print(f"{CLI_GREEN}Using Antigravity (human-in-the-loop) provider{CLI_CLR}")
         return AntigravityProvider()
+    elif provider_name == "claude":
+        print(f"{CLI_GREEN}Using Claude Code provider (model: {model or 'default'}){CLI_CLR}")
+        return ClaudeCodeProvider(model=model)
     elif provider_name == "opencode":
         return OpencodeProvider()
     else:
         raise ValueError(
-            f"Unknown LLM_PROVIDER: {provider_name}. Use 'openrouter', 'antigravity', or 'opencode'."
+            f"Unknown LLM_PROVIDER: {provider_name}. Use 'openrouter', 'claude', 'antigravity', or 'opencode'."
         )

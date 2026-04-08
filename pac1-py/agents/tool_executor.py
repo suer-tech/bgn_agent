@@ -17,10 +17,14 @@ MAX_RESULT_LENGTH = 10000
 
 # Read-only paths — writing/deleting is blocked
 READ_ONLY_PATHS = {"/AGENTS.md", "AGENTS.md", "AGENTS.MD"}
-READ_ONLY_PREFIXES = ["/01_capture/", "01_capture/"]
+READ_ONLY_PREFIXES = []
 
 # Dangerous tools that modify data
 WRITE_TOOLS = {"write", "delete", "move", "mkdir"}
+
+# Sensitive files that need semantic protection (Oracle/OTP)
+SENSITIVE_FILES = {"otp.txt", "secrets.json", ".env"}
+IDENTITY_FILES = {"docs/channels/", "contacts/"}
 
 
 def execute_tool(
@@ -61,9 +65,11 @@ def execute_tool(
     if name in WRITE_TOOLS:
         target_path = args.get("path", "") or args.get("to_name", "")
 
-        # Check exact matches
+        # Check exact matches or folder-relative matches
+        target_path_lower = target_path.lower().replace("\\", "/")
         for ro_path in READ_ONLY_PATHS:
-            if ro_path.lower() in target_path.lower():
+            ro_path_lower = ro_path.lower().lstrip("/")
+            if target_path_lower == ro_path_lower or target_path_lower.endswith("/" + ro_path_lower):
                 result = f"SECURITY BLOCK: File is read-only: {target_path}"
                 _log_tool_event(trace_logger, step_name, name, args, result, False, start_time)
                 return result
@@ -74,6 +80,16 @@ def execute_tool(
                 result = f"SECURITY BLOCK: Directory is read-only: {target_path}"
                 _log_tool_event(trace_logger, step_name, name, args, result, False, start_time)
                 return result
+
+    # ----- Guardrail 3: Sensitive File Access -----
+    target_path = args.get("path", "") or args.get("from_name", "") or args.get("to_name", "")
+    if any(s.lower() in target_path.lower() for s in SENSITIVE_FILES):
+        # We allow reads ONLY if the planner can justify it (to be expanded later),
+        # but for now, block all raw reads to prevent OTP leaks in logs or to LLM if not needed.
+        if name in ("read", "cat") and "otp.txt" in target_path.lower():
+            result = "SECURITY BLOCK: Direct access to OTP secrets is restricted. Use valid workflow."
+            _log_tool_event(trace_logger, step_name, name, args, result, False, start_time)
+            return result
 
     # ----- Execute the tool -----
     result = dispatch_tool(vm_client, tool_call)

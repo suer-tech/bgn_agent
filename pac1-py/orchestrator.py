@@ -23,10 +23,16 @@ from agents.types import (
     AgentState,
     ScratchpadState,
     ReportTaskCompletion,
+    AuthorityMap,
     get_outcome_map,
 )
 from agents.triage_node import run_triage
 from agents.bootstrap_node import run_bootstrap
+from agents.task_node import run_task_extraction
+from agents.context_gatherer import gather_entity_context, format_gathered_context
+from agents.security_node import run_post_context_security
+from agents.validator_node import run_post_mutation_validation
+from agents.subagent_node import run_subagent_session
 from agents.execution_agent import build_planner_prompt, plan_next_step
 from agents.tool_executor import execute_tool
 from agents.pcm_helpers import send_answer
@@ -38,6 +44,7 @@ CLI_GREEN = "\x1b[32m"
 CLI_CLR = "\x1b[0m"
 CLI_YELLOW = "\x1b[33m"
 CLI_BLUE = "\x1b[34m"
+CLI_CYAN = "\x1b[36m"
 
 
 class Orchestrator:
@@ -85,12 +92,32 @@ class Orchestrator:
         state: AgentState = {
             "task_text": task_text,
             "triage_result": None,
+            "task_model": None,
             "workspace_rules": {},
+            "authority_map": AuthorityMap(),
             "scratchpad": ScratchpadState(),
+            "entity_context": "",
             "conversation_history": [],
             "is_completed": False,
             "final_outcome": "",
         }
+
+        # =====================================================================
+        # Step 1b: Get sandbox current date
+        # =====================================================================
+        sandbox_date = ""
+        try:
+            from bitgn.vm.pcm_pb2 import ContextRequest
+            from google.protobuf.json_format import MessageToDict
+            ctx_result = vm.context(ContextRequest())
+            ctx_dict = MessageToDict(ctx_result)
+            time_str = ctx_dict.get("time", "")
+            if time_str:
+                sandbox_date = time_str[:10]  # Extract YYYY-MM-DD
+                state["task_text"] = f"[Current date: {sandbox_date}]\n{state['task_text']}"
+                print(f"{CLI_GREEN}Sandbox date: {sandbox_date}{CLI_CLR}")
+        except Exception as e:
+            print(f"{CLI_YELLOW}Could not get sandbox date: {e}{CLI_CLR}")
 
         # =====================================================================
         # Step 2: Triage (1 LLM call)
@@ -100,7 +127,9 @@ class Orchestrator:
 
         if state["is_completed"]:
             outcome = state["final_outcome"]
-            reason = state["triage_result"].reason if state["triage_result"] else "Unknown"
+            reason = (
+                state["triage_result"].reason if state["triage_result"] else "Unknown"
+            )
             print(f"{CLI_RED}TRIAGE BLOCKED: {outcome} — {reason}{CLI_CLR}")
 
             # Send answer to PCM
@@ -112,7 +141,9 @@ class Orchestrator:
             return self._build_result(state, task_id, start_time, 0)
 
         triage_info = state["triage_result"]
-        print(f"{CLI_GREEN}Triage passed: {triage_info.intent.value} — {triage_info.reason}{CLI_CLR}")
+        print(
+            f"{CLI_GREEN}Triage passed: {triage_info.intent.value} — {triage_info.reason}{CLI_CLR}"
+        )
 
         # =====================================================================
         # Step 3: Bootstrap (0 LLM calls)
@@ -123,12 +154,70 @@ class Orchestrator:
         rules_count = len(state["workspace_rules"])
         print(f"{CLI_GREEN}Loaded {rules_count} rule files{CLI_CLR}")
         for path in state["workspace_rules"]:
-            print(f"  📄 {path}")
+            print(f"  [Rule] {path}")
 
         # =====================================================================
-        # Step 4: Execution Loop
+        # Step 4: Structured Task Extraction (1 LLM call)
         # =====================================================================
-        print(f"{CLI_YELLOW}[3/3] Execution loop (max {max_iterations} steps)...{CLI_CLR}")
+        print(f"{CLI_YELLOW}[3/4] Task Model — extracting structure...{CLI_CLR}")
+        state = run_task_extraction(state, self.provider, self.trace_logger)
+
+        model = state["task_model"]
+        print(
+            f"{CLI_GREEN}Task Model Ready: {model.domain.value} - {model.requested_effect}{CLI_CLR}"
+        )
+
+        # =====================================================================
+        # Step 5: Decision Gate (Ambiguity & Security)
+        # =====================================================================
+        if model.ambiguity_high and model.intent in ("MUTATION", "SECURITY_DENIAL"):
+            print(
+                f"{CLI_RED}DECISION GATE: STOP — High Ambiguity for Mutation{CLI_CLR}"
+            )
+            state["final_outcome"] = "OUTCOME_NONE_CLARIFICATION"
+            state["is_completed"] = True
+            send_answer(
+                vm,
+                f"Request is too ambiguous for action: {model.requested_effect}",
+                state["final_outcome"],
+            )
+            return self._build_result(state, task_id, start_time, 0)
+
+        if model.security_risk_high and model.intent == "SECURITY_DENIAL":
+            print(f"{CLI_RED}DECISION GATE: STOP — High Security Risk Denial{CLI_CLR}")
+            state["final_outcome"] = "OUTCOME_DENIED_SECURITY"
+            state["is_completed"] = True
+            send_answer(
+                vm,
+                f"Request denied for security reasons: {model.requested_effect}",
+                state["final_outcome"],
+            )
+            return self._build_result(state, task_id, start_time, 0)
+
+        # =====================================================================
+        # Step 5b: Entity Context Gathering (deterministic, no LLM)
+        # =====================================================================
+        if model.target_entities:
+            print(f"{CLI_YELLOW}[4a/4] Gathering entity context...{CLI_CLR}")
+            try:
+                contexts = gather_entity_context(vm, model.target_entities)
+                state["entity_context"] = format_gathered_context(contexts)
+                file_count = sum(len(c.related_files) for c in contexts.values())
+                print(f"{CLI_GREEN}Gathered context: {len(contexts)} entities, {file_count} related files{CLI_CLR}")
+                # Debug: show all date mentions with context
+                for ename, ectx in contexts.items():
+                    for dm in ectx.date_mentions:
+                        print(f"  [Date] {dm.file_path} | {dm.label} | {dm.value}")
+            except Exception as e:
+                print(f"{CLI_YELLOW}Context gathering failed (non-fatal): {e}{CLI_CLR}")
+                state["entity_context"] = ""
+
+        # =====================================================================
+        # Step 6: Execution Loop
+        # =====================================================================
+        print(
+            f"{CLI_YELLOW}[4/4] Execution loop (max {max_iterations} steps)...{CLI_CLR}"
+        )
 
         tool_calls_log = []
         iteration = 0
@@ -164,68 +253,136 @@ class Orchestrator:
             print(f"  📝 Goal: {next_step.scratchpad_update.current_goal[:100]}")
             print(f"  📋 Plan: {next_step.plan_remaining_steps_brief[0]}")
 
-            # 4c. Check for completion
-            if isinstance(next_step.function, ReportTaskCompletion):
+            # 4c. Delegate to Subagent (check BEFORE completion — LLM may return both)
+            if next_step.subagent_delegation:
+                task = next_step.subagent_delegation
+                print(
+                    f"{CLI_CYAN}  -> Delegating to SUBAGENT: {task.subagent_id}{CLI_CLR}"
+                )
+                print(f"{CLI_CYAN}     Instruction: {task.instruction}{CLI_CLR}")
+
+                sub_result = run_subagent_session(
+                    domain=task.subagent_id,
+                    task=task,
+                    state=state,
+                    llm_provider=self.provider,
+                    vm_client=vm,
+                    trace_logger=self.trace_logger,
+                )
+
+                # Feedback sub-result to Planner in the next iteration
+                status_str = "SUCCESS" if sub_result.success else "FAILED"
+                result_text = f"[SUBAGENT {task.subagent_id} RESULT - {status_str}]: {sub_result.message}"
+                if sub_result.grounding_refs:
+                    result_text += f"\nRefs: {', '.join(sub_result.grounding_refs)}"
+
+                print(f"{CLI_CYAN}  <- Subagent returned: {status_str}{CLI_CLR}")
+
+                # Skip normal tool execution since subagent handled it
+                tool_name = f"subagent_{task.subagent_id}"
+                tool_args = task.model_dump()
+            elif isinstance(next_step.function, ReportTaskCompletion):
                 final_answer = next_step.function.message
                 grounding_refs = next_step.function.grounding_refs
                 completed_steps = next_step.function.completed_steps_laconic
                 state["final_outcome"] = next_step.function.outcome
                 state["is_completed"] = True
 
-                status = CLI_GREEN if next_step.function.outcome == "OUTCOME_OK" else CLI_YELLOW
+                status = (
+                    CLI_GREEN
+                    if next_step.function.outcome == "OUTCOME_OK"
+                    else CLI_YELLOW
+                )
                 print(f"{status}TASK COMPLETED: {next_step.function.outcome}{CLI_CLR}")
                 print(f"Summary: {final_answer}")
                 if grounding_refs:
                     print(f"References: {', '.join(grounding_refs)}")
                 break
+            else:
+                # 4d. Execute tool
+                tool_name = next_step.function.tool
+                tool_args = next_step.function.model_dump()
+                # Remove 'tool' key from args since it's the tool name
+                tool_args.pop("tool", None)
 
-            # 4d. Execute tool
-            tool_name = next_step.function.tool
-            tool_args = next_step.function.model_dump()
-            # Remove 'tool' key from args since it's the tool name
-            tool_args.pop("tool", None)
+                tool_call = {"name": tool_name, "arguments": tool_args}
 
-            tool_call = {"name": tool_name, "arguments": tool_args}
+                print(
+                    f"  (Tool) {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}"
+                )
 
-            print(f"  🔧 {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}")
-
-            result_text = execute_tool(
-                tool_call=tool_call,
-                vm_client=vm,
-                trace_logger=self.trace_logger,
-                step_name=step_name,
-            )
+                result_text = execute_tool(
+                    tool_call=tool_call,
+                    vm_client=vm,
+                    trace_logger=self.trace_logger,
+                    step_name=step_name,
+                )
 
             print(f"{CLI_GREEN}OUT{CLI_CLR}: {result_text[:200]}...")
 
+            # ----- Step 4e: Post-context Security Guard -----
+            if tool_name in ("read", "cat") and len(result_text) > 50:
+                read_path = tool_args.get("path", "")
+                security_check = run_post_context_security(
+                    result_text, self.provider, self.trace_logger,
+                    file_path=read_path,
+                )
+                if security_check.reason and "trusted" not in (security_check.reason or "").lower() and "safe" not in (security_check.reason or "").lower():
+                    print(f"{CLI_YELLOW}  [Security] scanned {read_path}{CLI_CLR}")
+                if not security_check.allowed:
+                    print(
+                        f"{CLI_RED}SECURITY BLOCK: Content detected as injection!{CLI_CLR}"
+                    )
+                    state["final_outcome"] = "OUTCOME_DENIED_SECURITY"
+                    state["is_completed"] = True
+                    final_answer = f"Security block: {security_check.reason}"
+                    break
+
+            # ----- Step 4f: Post-mutation Invariant Validation -----
+            if tool_name in ("write", "delete", "move", "mkdir"):
+                print(f"{CLI_YELLOW}  [Validation] mutation invariants...{CLI_CLR}")
+                warnings = run_post_mutation_validation(
+                    state, vm, tool_call, self.trace_logger
+                )
+                if warnings:
+                    print(f"{CLI_YELLOW}VALIDATION WARNING: {warnings[0]}{CLI_CLR}")
+                    # Add as feedback to the next step
+                    result_text += "\n\n[VALIDATION FEEDBACK]: " + "\n".join(warnings)
+
             # Track tool call for results
-            tool_calls_log.append({
-                "iteration": step_name,
-                "tool_name": tool_name,
-                "arguments": tool_args,
-                "result": result_text[:200],
-            })
+            tool_calls_log.append(
+                {
+                    "iteration": step_name,
+                    "tool_name": tool_name,
+                    "arguments": tool_args,
+                    "result": result_text[:200],
+                }
+            )
 
             # Add to conversation history
-            state["conversation_history"].append({
-                "role": "assistant",
-                "content": next_step.plan_remaining_steps_brief[0],
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "id": step_name,
-                        "function": {
-                            "name": tool_name,
-                            "arguments": next_step.function.model_dump_json(),
-                        },
-                    }
-                ],
-            })
-            state["conversation_history"].append({
-                "role": "tool",
-                "content": result_text,
-                "tool_call_id": step_name,
-            })
+            state["conversation_history"].append(
+                {
+                    "role": "assistant",
+                    "content": next_step.plan_remaining_steps_brief[0],
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": step_name,
+                            "function": {
+                                "name": tool_name,
+                                "arguments": next_step.function.model_dump_json(),
+                            },
+                        }
+                    ],
+                }
+            )
+            state["conversation_history"].append(
+                {
+                    "role": "tool",
+                    "content": result_text,
+                    "tool_call_id": step_name,
+                }
+            )
 
         # Handle timeout
         if not state["is_completed"]:
@@ -260,7 +417,9 @@ class Orchestrator:
                 "iterations_used": iteration + 1,
                 "tool_calls_count": len(tool_calls_log),
                 "rules_loaded": len(state["workspace_rules"]),
-                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
+                "triage_intent": state["triage_result"].intent.value
+                if state["triage_result"]
+                else "",
             },
         )
 
@@ -277,7 +436,9 @@ class Orchestrator:
             "context": {
                 "rules_loaded": len(state["workspace_rules"]),
                 "rule_paths": list(state["workspace_rules"].keys()),
-                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
+                "triage_intent": state["triage_result"].intent.value
+                if state["triage_result"]
+                else "",
             },
         }
 
@@ -315,6 +476,8 @@ class Orchestrator:
             "iterations_used": iterations,
             "duration_seconds": duration,
             "context": {
-                "triage_intent": state["triage_result"].intent.value if state["triage_result"] else "",
+                "triage_intent": state["triage_result"].intent.value
+                if state["triage_result"]
+                else "",
             },
         }

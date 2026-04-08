@@ -93,6 +93,10 @@ class ScratchpadState(BaseModel):
         default_factory=list,
         description="Список файлов, которые еще предстоит обработать",
     )
+    current_workflow: Optional[str] = Field(
+        default=None,
+        description="Current active workflow (e.g., 'INBOX_PROCESS_LOWEST')",
+    )
 
 
 # =============================================================================
@@ -104,11 +108,50 @@ class IntentType(str, Enum):
     MUTATION = "MUTATION"      # Изменение данных
     UNSUPPORTED = "UNSUPPORTED"  # Действия вне песочницы
     ATTACK = "ATTACK"          # Попытка взлома или извлечения секретов
+    CLARIFY_NEEDED = "CLARIFY_NEEDED" # Требуется уточнение
+    SECURITY_DENIAL = "SECURITY_DENIAL" # Отказ по соображениям безопасности
+
+
+class DomainType(str, Enum):
+    KNOWLEDGE_REPO = "KNOWLEDGE_REPO"
+    TYPED_CRM = "TYPED_CRM"
+    INBOX_WORKFLOW = "INBOX_WORKFLOW"
+    REPAIR_DIAGNOSTICS = "REPAIR_DIAGNOSTICS"
+    GENERAL = "GENERAL"
+
+
+class AuthorityLevel(str, Enum):
+    ROOT = "ROOT"
+    NESTED = "NESTED"
+    FOLDER = "FOLDER"
+    PROCESS = "PROCESS"
+
+
+class AuthorityRule(BaseModel):
+    path: str
+    content: str
+    level: AuthorityLevel
+    scope: str = "/"  # Path where this rule is applicable
+
+
+class AuthorityMap(BaseModel):
+    """Hierarchical authority rules with scope awareness."""
+    rules: List[AuthorityRule] = Field(default_factory=list)
+
+    def get_rules_for_path(self, target_path: str) -> List[AuthorityRule]:
+        """Return rules applicable to the given path, sorted by specificity."""
+        applicable = [
+            r for r in self.rules 
+            if target_path.startswith(r.scope)
+        ]
+        # Sort by scope length descending (most specific first)
+        return sorted(applicable, key=lambda x: len(x.scope), reverse=True)
 
 
 class TriageDecision(BaseModel):
     is_safe: bool
     intent: IntentType
+    domain: DomainType = Field(default=DomainType.GENERAL)
     reason: str
 
 
@@ -116,11 +159,26 @@ class TriageDecision(BaseModel):
 # State Machine: Main Agent State
 # =============================================================================
 
+class TaskModel(BaseModel):
+    """Structured understanding of the user request."""
+    domain: DomainType
+    intent: IntentType
+    requested_effect: str  # e.g., "send_email", "update_contact", "find_password"
+    target_entities: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    ambiguity_high: bool = False
+    security_risk_high: bool = False
+    terminal_mode_candidate: Optional[str] = None
+
+
 class AgentState(TypedDict):
     task_text: str                                # Оригинальный запрос <user_input>
     triage_result: Optional[TriageDecision]
-    workspace_rules: Dict[str, str]               # Загруженные правила: {"/AGENTS.md": "текст", ...}
+    task_model: Optional[TaskModel]               # New: structured task model
+    workspace_rules: Dict[str, str]               # Legacy: flat rules for backward compatibility
+    authority_map: AuthorityMap                   # New: hierarchical rules
     scratchpad: ScratchpadState                    # Оперативная память агента
+    entity_context: str                           # Pre-gathered context for target entities
     conversation_history: List[dict]               # Лог LLM-вызовов
     is_completed: bool                             # Флаг завершения цикла
     final_outcome: str                             # OUTCOME_OK, OUTCOME_DENIED_SECURITY и т.д.
@@ -218,9 +276,29 @@ class Req_Move(BaseModel):
 # Execution Planner: NextStep with Scratchpad
 # =============================================================================
 
+# =============================================================================
+# Execution Planner: Subagent Delegation
+# =============================================================================
+
+class SubagentTask(BaseModel):
+    """Specific assignment for a subagent."""
+    subagent_id: str  # e.g., "crm", "knowledge", "inbox"
+    instruction: str
+    target_paths: List[str] = Field(default_factory=list)
+    context_data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SubagentResult(BaseModel):
+    """Outcome returned from a subagent back to the Planner."""
+    success: bool
+    message: str
+    entities: Dict[str, Any] = Field(default_factory=dict)
+    grounding_refs: List[str] = Field(default_factory=list)
+
+
 class NextStep(BaseModel):
     current_state: str
-    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(5)] = Field(
+    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(8)] = Field(
         ...,
         description="briefly explain the next useful steps",
     )
@@ -229,6 +307,10 @@ class NextStep(BaseModel):
         description="Обновлённая памятка агента. Записывай найденные ID в found_entities!",
     )
     task_completed: bool
+    subagent_delegation: Optional[SubagentTask] = Field(
+        default=None,
+        description="Optional: hand off a specific sub-task to a domain subagent"
+    )
     function: Union[
         ReportTaskCompletion,
         Req_Context,

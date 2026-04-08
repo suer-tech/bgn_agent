@@ -7,12 +7,17 @@ reads each referenced file, and populates state["workspace_rules"].
 import re
 from typing import List, Optional
 
-from agents.types import AgentState
-from agents.pcm_helpers import safe_read_file
+from agents.types import (
+    AgentState, 
+    AuthorityMap, 
+    AuthorityRule, 
+    AuthorityLevel, 
+    DomainType
+)
+from agents.pcm_helpers import safe_read_file, format_tree
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import TreeRequest
 from llm_logger import LLMTraceLogger
-from agents.pcm_helpers import safe_read_file, format_tree
 
 
 # Multiple candidate names for the agents file
@@ -65,72 +70,44 @@ def run_bootstrap(
 ) -> AgentState:
     """Load workspace rules deterministically (no LLM calls).
 
-    1. Find and read /AGENTS.md
-    2. Extract all .md links via regex
-    3. Read each referenced file
-    4. Populate state["workspace_rules"]
-
-    Args:
-        state: Current agent state.
-        vm_client: PCM runtime client.
-        trace_logger: Optional logger for diagnostics.
-
-    Returns:
-        Updated AgentState with workspace_rules populated.
+    1. Find and read /AGENTS.md (Root Authority)
+    2. Extract and read referenced files (Process Authority)
+    3. Perform domain-conditioned discovery (Folder/Nested Authority)
+    4. Populate hierarchical authority_map and flat workspace_rules.
     """
     rules = {}
+    auth_map = AuthorityMap()
+    triage = state.get("triage_result")
+    domain = triage.domain if triage else DomainType.GENERAL
 
-    # Step 1: Find AGENTS.md
+    # --- Step 1: Find Root AGENTS.md ---
     agents_path = None
     agents_content = None
 
     for candidate in AGENTS_CANDIDATES:
         content = safe_read_file(vm_client, candidate)
         if content is not None:
-            agents_path = candidate
+            agents_path = f"/{candidate}" if not candidate.startswith("/") else candidate
             agents_content = content
             break
 
-    if trace_logger:
-        trace_logger.log_agent_event(
-            agent_name="bootstrap_node",
-            event="agents_md_search",
-            details={
-                "candidates_tried": AGENTS_CANDIDATES,
-                "found": agents_path,
-                "content_length": len(agents_content) if agents_content else 0,
-            },
-        )
-
     if not agents_content:
-        if trace_logger:
-            trace_logger.log_agent_event(
-                agent_name="bootstrap_node",
-                event="agents_md_not_found",
-                details={"error": "No AGENTS.md found in any candidate path"},
-            )
         state["workspace_rules"] = rules
+        state["authority_map"] = auth_map
         return state
 
-    # Store AGENTS.md with canonical key
+    # Add Root Authority
     rules["/AGENTS.md"] = agents_content
+    auth_map.rules.append(AuthorityRule(
+        path=agents_path,
+        content=agents_content,
+        level=AuthorityLevel.ROOT,
+        scope="/"
+    ))
 
-    # Step 2: Extract all referenced .md links
+    # --- Step 2: Extract Referenced Process Rules ---
     referenced_paths = _extract_md_links(agents_content)
-
-    if trace_logger:
-        trace_logger.log_agent_event(
-            agent_name="bootstrap_node",
-            event="links_extracted",
-            details={
-                "referenced_paths": referenced_paths,
-                "count": len(referenced_paths),
-            },
-        )
-
-    # Step 3: Read each referenced file
     for rel_path in referenced_paths:
-        # Try both with and without leading slash
         content = safe_read_file(vm_client, rel_path)
         if content is None:
             content = safe_read_file(vm_client, f"/{rel_path}")
@@ -138,50 +115,103 @@ def run_bootstrap(
         if content is not None:
             key = f"/{rel_path}" if not rel_path.startswith("/") else rel_path
             rules[key] = content
+            auth_map.rules.append(AuthorityRule(
+                path=key,
+                content=content,
+                level=AuthorityLevel.PROCESS,
+                scope="/"
+            ))
 
-            if trace_logger:
-                trace_logger.log_agent_event(
-                    agent_name="bootstrap_node",
-                    event="rule_file_loaded",
-                    details={
-                        "path": key,
-                        "content_length": len(content),
-                        "content_preview": content[:200],
-                    },
-                )
-        else:
-            if trace_logger:
-                trace_logger.log_agent_event(
-                    agent_name="bootstrap_node",
-                    event="rule_file_not_found",
-                    details={"path": rel_path},
-                )
+    # --- Step 3: Domain-Conditioned Discovery ---
+    # Load READMEs for all relevant folders + processing docs
+    domain_discovery_paths = []
+    if domain in (DomainType.KNOWLEDGE_REPO,):
+        domain_discovery_paths = [
+            "00_inbox/README.md",
+            "01_capture/README.md",
+            "02_distill/README.md",
+            "99_process/README.md",
+        ]
+    elif domain == DomainType.INBOX_WORKFLOW:
+        domain_discovery_paths = [
+            "inbox/README.md",
+            "docs/inbox-msg-processing.md",
+            "docs/inbox-task-processing.md",
+            "docs/channels/AGENTS.MD",
+            "docs/channels/Discord.txt",
+            "docs/channels/Telegram.txt",
+            # Note: otp.txt intentionally NOT pre-loaded (sensitive)
+            "contacts/README.md",
+            "accounts/README.md",
+            "outbox/README.md",
+            "my-invoices/README.MD",
+            "reminders/README.MD",
+        ]
+    elif domain == DomainType.TYPED_CRM:
+        domain_discovery_paths = [
+            "contacts/README.md",
+            "accounts/README.md",
+            "outbox/README.md",
+            "my-invoices/README.MD",
+            "reminders/README.MD",
+            "opportunities/README.MD",
+            "01_notes/README.MD",
+        ]
+    elif domain == DomainType.REPAIR_DIAGNOSTICS:
+        domain_discovery_paths = [
+            "docs/repair/README.md",
+            "config/README.md",
+        ]
 
-    # Step 4: Deterministic tree extraction for /99_process/
+    for path in domain_discovery_paths:
+        content = safe_read_file(vm_client, path)
+        if content:
+            key = f"/{path}" if not path.startswith("/") else path
+            scope = "/".join(key.split("/")[:-1]) or "/"
+            rules[key] = content
+            auth_map.rules.append(AuthorityRule(
+                path=key,
+                content=content,
+                level=AuthorityLevel.FOLDER,
+                scope=scope
+            ))
+
+    # --- Step 4: Nested AGENTS.md Discovery (Heuristic) ---
+    # We look for AGENTS.md in common subdirectories if relevant
+    nested_candidates = []
+    if domain == DomainType.TYPED_CRM:
+        nested_candidates = ["contacts/AGENTS.md", "accounts/AGENTS.md"]
+    elif domain == DomainType.KNOWLEDGE_REPO:
+        nested_candidates = ["99_process/AGENTS.md"]
+
+    for path in nested_candidates:
+        content = safe_read_file(vm_client, path)
+        if content:
+            key = f"/{path}" if not path.startswith("/") else path
+            scope = "/".join(key.split("/")[:-1]) or "/"
+            rules[key] = content
+            auth_map.rules.append(AuthorityRule(
+                path=key,
+                content=content,
+                level=AuthorityLevel.NESTED,
+                scope=scope
+            ))
+
+    # --- Step 5: Full repo tree for orientation ---
     try:
-        tree_result = vm_client.tree(TreeRequest(root="/99_process/", level=2))
-        formatted_tree = format_tree({"root": "/99_process/", "level": 2}, tree_result)
+        tree_result = vm_client.tree(TreeRequest(root="/", level=2))
+        formatted_tree = format_tree({"root": "/", "level": 2}, tree_result)
         rules["tree_process"] = formatted_tree
-        
-        if trace_logger:
-            trace_logger.log_agent_event(
-                agent_name="bootstrap_node",
-                event="process_tree_extracted",
-                details={
-                    "root": "/99_process/",
-                    "tree_preview": formatted_tree[:200]
-                },
-            )
-    except Exception as e:
-        if trace_logger:
-            trace_logger.log_agent_event(
-                agent_name="bootstrap_node",
-                event="process_tree_failed",
-                details={"error": str(e)},
-            )
-        rules["tree_process"] = "Failed to load /99_process/ tree"
+    except:
+        try:
+            tree_result = vm_client.tree(TreeRequest(root="/99_process/", level=2))
+            formatted_tree = format_tree({"root": "/99_process/", "level": 2}, tree_result)
+            rules["tree_process"] = formatted_tree
+        except:
+            rules["tree_process"] = "Failed to load tree"
 
     state["workspace_rules"] = rules
+    state["authority_map"] = auth_map
 
     if trace_logger:
         trace_logger.log_agent_event(
@@ -189,7 +219,8 @@ def run_bootstrap(
             event="bootstrap_completed",
             details={
                 "total_rules_loaded": len(rules),
-                "rule_paths": list(rules.keys()),
+                "authority_rules_count": len(auth_map.rules),
+                "domain": domain.value
             },
         )
 
