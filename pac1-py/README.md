@@ -24,3 +24,13 @@ Useful environment overrides:
 - `BENCHMARK_HOST` defaults to `https://api.bitgn.com`
 - `BENCHMARK_ID` defaults to `bitgn/pac1-dev`
 - `MODEL_ID` defaults to `gpt-4.1-2025-04-14`
+
+Antigravity file bridge:
+
+- Request messages are written to `logs/.llm_request.json`
+- Responses must be written to `logs/.llm_response.json`
+- Helper:
+
+```bash
+uv run python antigravity_reply.py response.json
+```

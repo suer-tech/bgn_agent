@@ -1,0 +1,508 @@
+import re
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from agents.types import ContextResult, TaskContext
+from agents.prompt_storage import get_prompt
+from bitgn.vm.mini_connect import MiniRuntimeClientSync
+from bitgn.vm.mini_pb2 import OutlineRequest, ReadRequest
+from google.protobuf.json_format import MessageToDict
+
+
+def _get_context_extraction_prompt() -> str:
+    try:
+        return get_prompt("context_extractor")
+    except FileNotFoundError:
+        return "You are a Context Extractor Agent."
+
+
+CONTEXT_EXTRACTION_PROMPT = _get_context_extraction_prompt()
+AGENTS_CANDIDATES = ["AGENTS.MD", "AGENTS.md", "Agent.md", "agent.md"]
+
+
+class LinkExtractionResponse(BaseModel):
+    referenced_files: List[str] = Field(default_factory=list)
+
+class FileDecisionItem(BaseModel):
+    path: str = Field(description="Relative path to the file to read")
+    reason: str = Field(description="Why this file is needed for the current task")
+
+
+class FileDecisionResponse(BaseModel):
+    files_to_read: List[FileDecisionItem] = Field(
+        default_factory=list,
+        description="List of files that should be read next, with reasons",
+    )
+    reasoning: str = Field(
+        description="Explanation of why these files were chosen and what the agent is looking for"
+    )
+    done: bool = Field(
+        description="Set to true when enough context has been gathered and no more files need to be read"
+    )
+
+
+CONTEXT_EXTRACTOR_SYSTEM_PROMPT = """You are a Context Extractor Agent. Your job is to determine which files in the workspace need to be read to fully understand the context for executing the user's task.
+
+Rules:
+1. AGENTS.MD is the main source of truth — always analyze it first to understand policies,    workflows, and which files or directories are relevant.
+2. Only request files that are directly relevant to the user's task.
+3. Do NOT request files that are templates (files starting with _ like _template.md),    archives, or historical records unless the task specifically requires them.
+4. If AGENTS.MD says "reference only this file", no additional files need to be read.
+5. If AGENTS.MD points to specific policy files or directories, prioritize those.
+6. Be conservative — request the minimum number of files needed to understand the task.
+7. Set done=true when you have enough context to proceed with task execution.
+8. Always use paths exactly as they appear in the directory tree. Do not invent paths.
+
+Return your decision as a structured response with files_to_read, reasoning, and done flag.
+"""
+
+
+def _normalize_rel_path(path: str) -> str:
+    p = (path or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    if p.startswith("/"):
+        p = p[1:]
+    return p
+
+
+def _to_abs_path(path: str) -> str:
+    p = _normalize_rel_path(path)
+    if not p:
+        return "/"
+    return f"/{p}"
+
+
+def _join_paths(base_path: str, target: str) -> str:
+    target = _normalize_rel_path(target)
+    if not target:
+        return ""
+    if "/" not in target:
+        base_dir = (
+            _normalize_rel_path(base_path).rsplit("/", 1)[0]
+            if "/" in _normalize_rel_path(base_path)
+            else ""
+        )
+        return f"{base_dir}/{target}".strip("/")
+    return target
+
+
+def _extract_exact_literal_answer(rule_text: str) -> Optional[str]:
+    if not isinstance(rule_text, str):
+        return None
+    patterns = [
+        r"""always\s+respond\s+with\s+["']([^"']+)["']""",
+        r"""respond\s+with\s+exactly\s+["']([^"']+)["']""",
+        r"""always\s+respond\s+with\s+([A-Za-z0-9._\-/]+)""",
+        r"""answer\s+with\s+exactly\s+([A-Za-z0-9._\-/]+)""",
+    ]
+    for p in patterns:
+        m = re.search(p, rule_text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _extract_policy_dirs(rule_text: str) -> List[str]:
+    if not isinstance(rule_text, str):
+        return []
+    found: List[str] = []
+    for m in re.finditer(r"""['"`]([a-zA-Z0-9_\-./]+/)['"`]""", rule_text):
+        d = _normalize_rel_path(m.group(1)).rstrip("/")
+        if d:
+            found.append(d)
+    for m in re.finditer(
+        r"""\b([a-zA-Z0-9_\-.]+(?:/[a-zA-Z0-9_\-.]+)*/)\b""", rule_text
+    ):
+        d = _normalize_rel_path(m.group(1)).rstrip("/")
+        if d and "://" not in d:
+            found.append(d)
+    out: List[str] = []
+    seen = set()
+    for d in found:
+        k = d.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(d)
+    return out
+
+
+def _extract_links_regex(content: str) -> List[str]:
+    refs: List[str] = []
+    patterns = [
+        r"""(?:^|[\s"'`(])([A-Za-z0-9_.\-/]+\.md)(?:$|[\s"'`),.:;])""",
+        r"""(?:see|read|open|check)\s+['"`]([^'"`]+\.md)['"`]""",
+    ]
+    for p in patterns:
+        for m in re.finditer(p, content, flags=re.IGNORECASE):
+            v = _normalize_rel_path(m.group(1))
+            if v:
+                refs.append(v)
+    out: List[str] = []
+    seen = set()
+    for r in refs:
+        k = r.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+
+
+def _build_tree_summary(tree_data: Dict) -> str:
+    """Build a compact text summary of the directory tree for LLM context."""
+    lines = []
+
+    def _walk(node, prefix=""):
+        name = node.get("name", node.get("path", "").split("/")[-1] or "/")
+        is_dir = node.get("is_dir", False)
+        lines.append(f"{prefix}{'[DIR] ' if is_dir else ''}{name}")
+        if is_dir:
+            children = node.get("children", [])
+            if isinstance(children, dict):
+                children = children.get("children", [])
+            for child in children if isinstance(children, list) else []:
+                _walk(child, prefix + "    ")
+
+    if isinstance(tree_data, dict):
+        _walk(tree_data)
+    return "\n".join(lines)
+
+
+def _collect_all_paths(tree_data: Dict, prefix: str = "") -> List[str]:
+    """Collect all file paths from the tree structure."""
+    paths = []
+
+    def _walk(node, current_prefix: str):
+        name = node.get("name", node.get("path", "").split("/")[-1] or "/")
+        is_dir = node.get("is_dir", False)
+        full_path = f"{current_prefix}/{name}".lstrip("/") if current_prefix else name
+
+        if not is_dir:
+            paths.append(full_path)
+        else:
+            children = node.get("children", [])
+            if isinstance(children, dict):
+                children = children.get("children", [])
+            for child in children if isinstance(children, list) else []:
+                _walk(child, full_path)
+
+    if isinstance(tree_data, dict):
+        _walk(tree_data, "")
+    return paths
+
+
+class ContextExtractor:
+    def __init__(self, provider=None):
+        self.provider = provider
+        self.prompt = CONTEXT_EXTRACTION_PROMPT
+
+    def _read_path(self, vm: MiniRuntimeClientSync, path: str) -> Optional[str]:
+        try:
+            result = vm.read(ReadRequest(path=path))
+            parsed = MessageToDict(result)
+            content = parsed.get("content", "")
+            return content if isinstance(content, str) else None
+        except Exception:
+            return None
+
+    def _extract_links_llm(self, content: str, current_path: str) -> List[str]:
+        if not self.provider or not content.strip():
+            return []
+        try:
+            msg = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract only file references to markdown files (*.md). "
+                        "Return relative paths only, no commentary."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Current file: {current_path}\n\n"
+                        f"Content:\n{content}\n\n"
+                        "Return references mentioned directly or implied by read/see instructions."
+                    ),
+                },
+            ]
+            parsed = self.provider.complete_as(msg, LinkExtractionResponse)
+            refs = [_normalize_rel_path(x) for x in parsed.referenced_files]
+            return [r for r in refs if r.lower().endswith(".md")]
+        except Exception:
+            return []
+
+    def _resolve_agents_path(self, vm: MiniRuntimeClientSync) -> Optional[str]:
+        for p in AGENTS_CANDIDATES:
+            content = self._read_path(vm, p)
+            if isinstance(content, str):
+                return p
+        return None
+    def _decide_next_files(
+        self,
+        task_text: str,
+        agents_content: str,
+        tree_summary: str,
+        all_paths: List[str],
+        already_read: Dict[str, str],
+    ) -> FileDecisionResponse:
+        """Use LLM to decide which files to read next based on task, AGENTS.MD, and current context."""
+        if not self.provider:
+            return FileDecisionResponse(done=True, reasoning="No LLM provider available")
+
+        read_files_summary = ""
+        if already_read:
+            parts = []
+            for p, c in already_read.items():
+                preview = c[:400].replace("\n", " ")
+                parts.append(f"### {p}\n{preview}...")
+            read_files_summary = "\n\n".join(parts)
+
+        available_paths = "\n".join(f"  - {p}" for p in all_paths)
+
+        user_msg = f"""Task: {task_text}
+
+## Directory Tree
+{tree_summary}
+
+## All Available File Paths
+{available_paths}
+
+## AGENTS.MD Content
+{agents_content}
+
+## Already Read Files (content shown)
+{read_files_summary if read_files_summary else "(none yet — AGENTS.MD was read but is not listed here)"}
+
+Based on the task, AGENTS.MD instructions, and workspace structure, decide which files need to be read next. Be conservative — only request files that are truly necessary. Always use paths exactly as they appear in the All Available File Paths list."""
+
+        try:
+            msg = [
+                {"role": "system", "content": CONTEXT_EXTRACTOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            return self.provider.complete_as(msg, FileDecisionResponse)
+        except Exception:
+            return FileDecisionResponse(
+                done=True, reasoning="LLM decision failed, stopping file reads"
+            )
+
+
+
+    def extract_task_graph(
+        self,
+        harness_url: str,
+        task_text: str,
+        max_llm_round: int = 30,
+        max_files: int = 500,
+    ) -> Dict[str, object]:
+        vm = MiniRuntimeClientSync(harness_url)
+
+        graph: Dict[str, object] = {
+            "user_question": task_text,
+            "directory_structure": {"status": "не получен", "data": None},
+            "agents_md": {
+                "path": None,
+                "full_path": None,
+                "status": "не получен",
+                "content": "",
+                "blocks": [],
+            },
+            "files": [],
+            "extract_status": "pending",
+        }
+        context_docs: Dict[str, str] = {}
+        required_policy_refs: List[str] = []
+        policy_dirs: List[str] = []
+        exact_literal_answer: Optional[str] = None
+        reference_only_this_file = False
+        requires_policy_ref = False
+
+        try:
+            outline = vm.outline(OutlineRequest(path="/"))
+            outline_dict = MessageToDict(outline)
+            graph["directory_structure"] = {"status": "получен", "data": outline_dict}
+        except Exception:
+            graph["directory_structure"] = {"status": "не получен", "data": None}
+
+        agents_path = self._resolve_agents_path(vm)
+        queue: List[tuple[str, Optional[str], int]] = []
+
+        if agents_path:
+            agents_content = self._read_path(vm, agents_path) or ""
+            graph["agents_md"] = {
+                "path": agents_path,
+                "full_path": _to_abs_path(agents_path),
+                "status": "получен" if agents_content else "не получен",
+                "content": agents_content,
+                "blocks": [],
+            }
+            if agents_content:
+                context_docs[agents_path] = agents_content
+                exact_literal_answer = _extract_exact_literal_answer(agents_content)
+                reference_only_this_file = (
+                    "reference only this file" in agents_content.lower()
+                )
+                requires_policy_ref = "policy file" in agents_content.lower()
+                policy_dirs = _extract_policy_dirs(agents_content)
+
+                llm_refs = self._extract_links_llm(agents_content, agents_path)
+                rx_refs = _extract_links_regex(agents_content)
+                refs = []
+                seen_refs = set()
+                for ref in llm_refs + rx_refs:
+                    resolved = _join_paths(agents_path, ref)
+                    if resolved and resolved.lower() not in seen_refs:
+                        seen_refs.add(resolved.lower())
+                        refs.append(resolved)
+                graph["agents_md"]["blocks"] = refs
+                queue.extend([(r, agents_path, 1) for r in refs])
+
+        visited = set()
+        files_nodes_map: Dict[str, Dict[str, object]] = {}
+        max_retry_rounds = 10
+
+        for _round in range(max_retry_rounds):
+            round_queue: List[tuple[str, Optional[str], int]] = list(queue)
+            queue.clear()
+
+            while round_queue and len(files_nodes_map) < max_nodes:
+                path, blocked_by, depth = round_queue.pop(0)
+                npath = _normalize_rel_path(path)
+                if not npath or npath.lower() in visited or depth > max_depth:
+                    continue
+
+                content = self._read_path(vm, npath)
+                node: Dict[str, object] = {
+                    "path": npath,
+                    "full_path": _to_abs_path(npath),
+                    "status": "получен" if isinstance(content, str) else "не получен",
+                    "content": content if isinstance(content, str) else "",
+                    "blocked_by": blocked_by,
+                    "blocks": [],
+                }
+                if isinstance(content, str):
+                    visited.add(npath.lower())
+                    context_docs[npath] = content
+                    if (
+                        npath.lower().endswith(".md")
+                        and npath not in required_policy_refs
+                    ):
+                        required_policy_refs.append(npath)
+
+                    llm_refs = self._extract_links_llm(content, npath)
+                    rx_refs = _extract_links_regex(content)
+                    refs = []
+                    seen_refs = set()
+                    for ref in llm_refs + rx_refs:
+                        resolved = _join_paths(npath, ref)
+                        if resolved and resolved.lower() not in seen_refs:
+                            seen_refs.add(resolved.lower())
+                            refs.append(resolved)
+                    node["blocks"] = refs
+                    for ref in refs:
+                        queue.append((ref, npath, depth + 1))
+                else:
+                    queue.append((npath, blocked_by, depth))
+
+                files_nodes_map[npath] = node
+
+            # Check if all fetched — if yes, stop retrying
+            if all(x.get("status") == "получен" for x in files_nodes_map.values()):
+                break
+            # Remove duplicates in queue (keep first occurrence)
+            deduped: List[tuple[str, Optional[str], int]] = []
+            seen_q: set = set()
+            for item in queue:
+                key = _normalize_rel_path(item[0]).lower()
+                if key and key not in seen_q:
+                    seen_q.add(key)
+                    deduped.append(item)
+            queue = deduped
+
+        files_nodes = list(files_nodes_map.values())
+
+        # Fallback for policy directories mentioned in AGENTS: read first markdown in each.
+        if requires_policy_ref and not required_policy_refs:
+            structure = graph.get("directory_structure", {}).get("data", {})
+            top_files = (
+                structure.get("files", []) if isinstance(structure, dict) else []
+            )
+            for entry in top_files if isinstance(top_files, list) else []:
+                if isinstance(entry, dict):
+                    p = _normalize_rel_path(entry.get("path", ""))
+                elif isinstance(entry, str):
+                    p = _normalize_rel_path(entry)
+                else:
+                    continue
+                if p.lower().endswith(".md") and p not in required_policy_refs:
+                    required_policy_refs.append(p)
+
+        graph["files"] = files_nodes
+
+        agents_ok = graph.get("agents_md", {}).get("status") == "получен"
+        tree_ok = graph.get("directory_structure", {}).get("status") == "получен"
+        deps_ok = all(x.get("status") == "получен" for x in files_nodes)
+        graph["extract_status"] = (
+            "complete" if (tree_ok and agents_ok and deps_ok) else "pending"
+        )
+
+        return {
+            "graph": graph,
+            "context_docs": context_docs,
+            "required_policy_refs": required_policy_refs,
+            "policy_dirs": policy_dirs,
+            "exact_literal_answer": exact_literal_answer,
+            "reference_only_this_file": reference_only_this_file,
+            "requires_policy_ref": requires_policy_ref,
+        }
+
+    def extract(self, harness_url: str) -> ContextResult:
+        return self.extract_with_llm(harness_url=harness_url, task_text="")
+
+    def extract_with_llm(self, harness_url: str, task_text: str) -> ContextResult:
+        payload = self.extract_task_graph(harness_url=harness_url, task_text=task_text)
+        graph = payload["graph"]
+
+        protected = ["AGENTS.MD", "AGENTS.md", ".git"]
+        if graph.get("agents_md", {}).get("path"):
+            protected.append(str(graph["agents_md"]["path"]))
+
+        return ContextResult(
+            user_profile={},
+            project_rules={
+                "extract_status": str(graph.get("extract_status", "pending")),
+            },
+            workspace_structure=graph.get("directory_structure", {}).get("data") or {},
+            success=graph.get("extract_status") == "complete",
+            errors=[],
+            protected_files=protected,
+            extraction_graph=graph,
+            extract_status=str(graph.get("extract_status", "pending")),
+            user_question=task_text,
+        )
+
+    def to_task_context(self, context_result: ContextResult) -> TaskContext:
+        protected = list(context_result.protected_files or [])
+        if "AGENTS.MD" not in protected:
+            protected.append("AGENTS.MD")
+        if "AGENTS.md" not in protected:
+            protected.append("AGENTS.md")
+        if ".git" not in protected:
+            protected.append(".git")
+
+        return TaskContext(
+            user_profile=context_result.user_profile,
+            project_rules=context_result.project_rules,
+            workspace_root=context_result.workspace_root,
+            protected_files=protected,
+            extraction_graph=context_result.extraction_graph,
+            user_question=context_result.user_question,
+        )
+
+
+def create_context_extractor():
+    return ContextExtractor()

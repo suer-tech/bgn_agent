@@ -31,6 +31,21 @@ class LLMTraceLogger:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_task = "".join(c if c.isalnum() or c in "._-" else "_" for c in task_id)
         self.task_log_path = self.log_dir / f"{safe_task}_{ts}.json"
+        self.task_summary_path = self.log_dir / "task_summary.txt"
+
+    def append_task_summary(self, title: str, details: Dict[str, Any]) -> None:
+        """Append a compact audit entry to task_summary.txt."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"[{ts}] {title}"]
+        if self.task_id:
+            lines.append(f"task_id: {self.task_id}")
+        for key, value in details.items():
+            if value is None:
+                continue
+            lines.append(f"{key}: {value}")
+        lines.append("")
+        with open(self.task_summary_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
 
     def log_exchange(
         self,
@@ -96,23 +111,9 @@ class LLMTraceLogger:
     def _append_task_log(self, entry: Dict[str, Any]) -> None:
         """Append entry to per-task log file."""
         try:
-            # Read existing data
-            if self.task_log_path.exists():
-                with open(self.task_log_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            else:
-                data = {
-                    "task_id": self.task_id,
-                    "task_text": self.task_text,
-                    "entries": [],
-                }
-
-            # Append new entry
+            data = self._read_task_log_data()
             data["entries"].append(entry)
-
-            # Write back
-            with open(self.task_log_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            self._write_task_log_data(data)
         except Exception:
             pass  # Silently fail for logging
 
@@ -139,23 +140,11 @@ class LLMTraceLogger:
         # Write to per-task log
         if hasattr(self, "task_log_path"):
             try:
-                if self.task_log_path.exists():
-                    with open(self.task_log_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                else:
-                    data = {
-                        "task_id": self.task_id,
-                        "task_text": self.task_text,
-                        "entries": [],
-                        "agent_events": [],
-                    }
-
+                data = self._read_task_log_data()
                 if "agent_events" not in data:
                     data["agent_events"] = []
                 data["agent_events"].append(payload)
-
-                with open(self.task_log_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self._write_task_log_data(data)
             except Exception:
                 pass
 
@@ -207,25 +196,115 @@ class LLMTraceLogger:
         # Write to per-task log
         if hasattr(self, "task_log_path"):
             try:
-                if self.task_log_path.exists():
-                    with open(self.task_log_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                else:
-                    data = {
-                        "task_id": self.task_id,
-                        "task_text": self.task_text,
-                        "entries": [],
-                        "tool_events": [],
-                    }
-
+                data = self._read_task_log_data()
                 if "tool_events" not in data:
                     data["tool_events"] = []
                 data["tool_events"].append(payload)
-
-                with open(self.task_log_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self._write_task_log_data(data)
             except Exception:
                 pass
+
+    def log_step_boundary(
+        self,
+        step_name: str,
+        boundary: str,
+        details: Dict[str, Any],
+    ) -> None:
+        self.log_agent_event(
+            agent_name="orchestrator",
+            event=f"step_{boundary}",
+            details={"step_name": step_name, **details},
+        )
+
+    def log_decision(
+        self,
+        step_name: str,
+        stage: str,
+        outcome: str,
+        reason: str,
+        details: Dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "step_name": step_name,
+            "stage": stage,
+            "outcome": outcome,
+            "reason": reason,
+        }
+        if details:
+            payload["details"] = details
+        self.log_agent_event(
+            agent_name="decision_engine",
+            event="decision_rationale",
+            details=payload,
+        )
+        self.append_task_summary(
+            title="decision_rationale",
+            details=payload,
+        )
+
+    def log_state_diff(
+        self,
+        step_name: str,
+        state_name: str,
+        before: Any,
+        after: Any,
+    ) -> None:
+        if before == after:
+            return
+        payload = {
+            "step_name": step_name,
+            "state_name": state_name,
+            "before": self._truncate_value(before),
+            "after": self._truncate_value(after),
+        }
+        self.log_agent_event(
+            agent_name="state_tracker",
+            event="state_diff",
+            details=payload,
+        )
+
+    def log_completion_decision(
+        self,
+        outcome: str,
+        message: str,
+        completed_steps: List[str],
+        grounding_refs: List[str],
+    ) -> None:
+        payload = {
+            "outcome": outcome,
+            "message": message[:500],
+            "completed_steps": completed_steps,
+            "grounding_refs": grounding_refs,
+        }
+        self.log_agent_event(
+            agent_name="orchestrator",
+            event="completion_decision",
+            details=payload,
+        )
+        self.append_task_summary(
+            title="completion_decision",
+            details=payload,
+        )
+
+    def _read_task_log_data(self) -> Dict[str, Any]:
+        if self.task_log_path.exists():
+            with open(self.task_log_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {
+            "task_id": self.task_id,
+            "task_text": self.task_text,
+            "entries": [],
+            "agent_events": [],
+            "tool_events": [],
+        }
+
+    def _write_task_log_data(self, data: Dict[str, Any]) -> None:
+        with open(self.task_log_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def _truncate_value(self, value: Any, limit: int = 1200) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return text[:limit]
 
 
     def write_task_summary(
@@ -258,9 +337,13 @@ class LLMTraceLogger:
         summary_lines.append("")
 
         # Phase 1: Context Extractor events
-        ctx_events = [e for e in agent_events if e.get("agent") == "context_extractor"]
+        ctx_events = [
+            e
+            for e in agent_events
+            if e.get("agent") in {"context_extractor", "bootstrap_node"}
+        ]
         if ctx_events:
-            summary_lines.append("## CONTEXT EXTRACTOR")
+            summary_lines.append("## BOOTSTRAP")
             summary_lines.append(separator)
             for evt in ctx_events:
                 event = evt.get("event", "")
@@ -275,9 +358,13 @@ class LLMTraceLogger:
                 summary_lines.append("")
 
         # Phase 2: Security Gate events
-        sec_events = [e for e in agent_events if e.get("agent") == "security_gate"]
+        sec_events = [
+            e
+            for e in agent_events
+            if e.get("agent") in {"security_gate", "security_node", "triage_node"}
+        ]
         if sec_events:
-            summary_lines.append("## SECURITY GATE")
+            summary_lines.append("## SECURITY")
             summary_lines.append(separator)
             for evt in sec_events:
                 event = evt.get("event", "")

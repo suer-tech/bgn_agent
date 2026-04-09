@@ -1,0 +1,75 @@
+{
+  "current_version": 10,
+  "versions": [
+    {
+      "version_id": 1,
+      "score": null,
+      "parent_version_id": 0,
+      "changes_summary": "Added checks to detect outputs resembling intermediate plans, enforce strict validation of file paths and content consistency against expected outputs, detect duplicate/conflicting file changes before final acceptance, and enhanced grounding consistency checks.",
+      "created_at": "2026-03-30T16:52:19.022530"
+    },
+    {
+      "version_id": 2,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Strengthened grounding checks to ensure all required references identified by context are included without hardcoding specific documents. Added detection and blocking of duplicate or conflicting file changes within tasks. Introduced semantic output consistency checks comparing output content with extracted templates and policy formats. Incorporated a generic checklist mechanism for verifying inclusion of relevant policy compliance references. Enhanced output shape validation to reject intermediate plans, drafts, or reasoning text. Maintained existing validation strength on format, completeness, success, and error detection.",
+      "created_at": "2026-03-30T17:09:20.900179"
+    },
+    {
+      "version_id": 3,
+      "score": null,
+      "parent_version_id": 2,
+      "changes_summary": "Added strict enforcement of answer precision to flag or reject imprecise or overly verbose answers containing additional information beyond exact required phrases. Introduced reusable validation patterns for detecting and handling such imprecision. Strengthened grounding verification by implementing a generic checklist mechanism for policy and compliance references, avoiding hardcoded filenames. Enhanced detection of duplicate or conflicting file operations within tasks. Maintained and reinforced existing validations on output shape, semantic consistency, and completeness.",
+      "created_at": "2026-03-30T17:28:16.971904"
+    },
+    {
+      "version_id": 4,
+      "score": null,
+      "parent_version_id": 3,
+      "changes_summary": "Added enforcement of universal duplicate file creation or modification detection and flagging within the same task execution. Incorporated blocking of final output acceptance if created or modified file contents or paths mismatch expected templates or formats. Introduced reusable template conformity validation steps for output files based on policy templates prior to release. Strengthened validation to reject outputs with reasoning, planning, or intermediate forms consistently. Maintained the generic approach by avoiding any task-specific hardcoding. Preserved all existing validation categories and checks while extending with these enhancements.",
+      "created_at": "2026-03-30T17:29:33.455004"
+    },
+    {
+      "version_id": 5,
+      "score": null,
+      "parent_version_id": 4,
+      "changes_summary": "Added a new section 'Policy Constraint Enforcement' to detect and block outputs or actions violating explicit task constraints, such as mandates for no actions or fixed phrase responses. Integrated generic assertions for policy constraints to be applied across tasks without hardcoding task-specific details. This enhancement enables early interception of disallowed outputs and strengthens validation against policy violations, addressing the failure of not preventing disallowed actions. Added a comment marker 'FIXED' to highlight the new section addition. No other prompt parts were changed to preserve existing strengths.",
+      "created_at": "2026-03-30T17:30:22.331362"
+    },
+    {
+      "version_id": 6,
+      "score": null,
+      "parent_version_id": 5,
+      "changes_summary": "Added reusable anomaly detection rules to flag unexpected, additional, or duplicate files in outputs such as unexpected file additions or duplicate file changes. Enhanced generic validation to dynamically compare created or modified file paths and content against expected naming conventions and templates derived from existing files/context, avoiding hardcoding task-specific data. Included semantic consistency checks ensuring final artifacts structurally and semantically match the user goal beyond syntactic correctness. Strengthened output shape validation to reject non-finalized intermediate outputs. Maintained general, reusable validation patterns applicable across similar tasks. Added FIXED comments highlighting new reusable mechanisms and general improvements.",
+      "created_at": "2026-03-30T17:41:38.779973"
+    },
+    {
+      "version_id": 7,
+      "score": null,
+      "parent_version_id": 6,
+      "changes_summary": "Added a reusable, generic validation mechanism to detect and reject any outputs that contain unauthorized actions or side effects when the policy mandates no actions, including detection of action sequences violating non-action constraints. Strengthened policy constraint enforcement to include these generic no-action checks derived dynamically from policy context or task conditions. Included FIXED comments to highlight these changes. Ensured all improvements are task-agnostic and reusable, avoiding hardcoded strings, paths, or task-specific logic.",
+      "created_at": "2026-03-30T17:43:31.933734"
+    },
+    {
+      "version_id": 8,
+      "score": null,
+      "parent_version_id": 7,
+      "changes_summary": "Added explicit validation steps to check that all required grounding references (policy, rule, and compliance documents) declared or implied by the task or metadata are included before accepting outputs. Incorporated reusable generic rules for detecting missing references without hardcoding specific filenames. Added raising of warnings or blocking acceptance if required references are not present. Enhanced generality by making all reference checks dynamic and based on task-internal data rather than fixed strings. Annotated changes with FIXED comments to highlight improvements.",
+      "created_at": "2026-03-30T17:44:19.497314"
+    },
+    {
+      "version_id": 9,
+      "score": null,
+      "parent_version_id": 8,
+      "changes_summary": "Added explicit instructions to adopt exact content matching techniques such as diff or hash-based checks to detect and reject subtle formatting deviations, especially whitespace and newline mismatches. Enhanced clarity on strict precision enforcement in final outputs. Included FIXED comments on changes to mark improvements. Reinforced that all validation improvements are reusable, generic, and avoid hardcoding task-specific data. No removal or weakening of existing validation rules, only strengthening precise formatting adherence.",
+      "created_at": "2026-03-30T17:51:45.052640"
+    },
+    {
+      "version_id": 10,
+      "score": null,
+      "parent_version_id": 9,
+      "changes_summary": "Added explicit validation instructions to normalize and enforce exact matching of trailing whitespace and newlines, including trailing newline differences, to prevent subtle formatting mismatches. Expanded output quality and additional checks to include these whitespace sensitivities. Strengthened generic reusable validation rules to detect minor formatting deviations throughout all content validation steps. Added FIXED comments to mark these improvements. Ensured that all fixes are generalizable and avoid hardcoding any task-specific details.",
+      "created_at": "2026-03-30T17:53:49.191850"
+    }
+  ]
+}
