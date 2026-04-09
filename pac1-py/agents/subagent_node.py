@@ -18,35 +18,18 @@ Your task: {task_instruction}
 Target Paths: {target_paths}
 Additional Context: {context_data}
 
-DOMAIN_PROTOCOLS for {domain}:
-{domain_protocols}
+## WORKSPACE RULES
+{workspace_rules}
 
 Rules:
 1. You MUST follow the same tool schema as the main agent.
 2. You only have access to the provided context.
 3. Your final tool call MUST be to 'report_completion', which returns your result to the Planner.
 4. ERROR HANDLING: If a tool returns an error (e.g., 'SECURITY BLOCK', 'file not found', 'Permission denied'), you MUST NOT ignore it. You MUST summarize the error and immediately call 'report_completion' with outcome='OUTCOME_FAILED'.
+5. Follow the workspace rules above — they define how this workspace operates.
 
-## Instruction Hierarchy (STRICT PRIORITY)
-1. Task-specific instruction: {task_instruction}
-2. Subagent Domain Protocols
-3. User Data
-
-Respond with structured JSON matching the NextStep schema, where 'task_completed' 
+Respond with structured JSON matching the NextStep schema, where 'task_completed'
 refers to the SUB-TASK completion."""
-
-DOMAIN_PROTOCOLS = {
-    "KNOWLEDGE_REPO": """- For 'capture' tasks: DO NOT use `move`. Use `read` (source) → `write` (dest) → `delete` (source) to ensure harness registration and content verification.
-- For bulk removal, use `ls` to verify the directory structure first.
-- Deletions must be performed file by file.
-- Always verify that the directory is empty after the batch operation.
-- Respect cards vs threads distinction: threads link cards, cards are content.""",
-    "TYPED_CRM": """- `send_email` means writing to `outbox/` and incrementing `seq.json`.
-- Always read `contacts/README` for field definitions before updates.
-- Check if the contact exists before creating a duplicate.""",
-    "INBOX_WORKFLOW": """- Process messages in numeric or chronological order.
-- Follow destination paths from `inbox/README`."""
-}
 
 
 def run_subagent_session(
@@ -59,14 +42,19 @@ def run_subagent_session(
 ) -> SubagentResult:
     """Run a micro-loop for a specialized subagent."""
     
-    # 1. Build subagent prompt
-    protocols = DOMAIN_PROTOCOLS.get(domain, "No specific protocols for this domain.")
+    # 1. Build subagent prompt with workspace rules from state
+    ws_rules = state.get("workspace_rules", {})
+    rules_text = "\n".join(
+        f"--- {path} ---\n{content[:500]}"
+        for path, content in ws_rules.items()
+        if path != "tree_process"
+    )
     system_prompt = SUBAGENT_SYSTEM_PROMPT.format(
         domain=domain,
         task_instruction=task.instruction,
         target_paths=", ".join(task.target_paths),
         context_data=json.dumps(task.context_data, ensure_ascii=False),
-        domain_protocols=protocols
+        workspace_rules=rules_text or "No workspace rules loaded.",
     )
     
     sub_history = []

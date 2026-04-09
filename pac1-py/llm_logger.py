@@ -14,7 +14,9 @@ class LLMTraceLogger:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         date_str = datetime.now().strftime("%Y-%m-%d")
-        self.log_path = self.log_dir / f"llm_trace_{date_str}.json"
+        task_id = os.environ.get("PAC1_TASK_ID", "")
+        suffix = f"_{task_id}" if task_id else ""
+        self.log_path = self.log_dir / f"llm_trace_{date_str}{suffix}.json"
         self.step_counter = 0
         self.task_id = ""
         self.task_text = ""

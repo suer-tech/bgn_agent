@@ -217,8 +217,10 @@ class AntigravityProvider(LLMProvider):
     def complete_as(self, messages: List[Dict[str, Any]], response_type: Type[T]) -> T:
         import json, os, time
 
-        req_file = ".llm_request.json"
-        res_file = ".llm_response.json"
+        task_id = os.environ.get("PAC1_TASK_ID", "")
+        suffix = f"_{task_id}" if task_id else ""
+        req_file = f".llm_request{suffix}.json"
+        res_file = f".llm_response{suffix}.json"
 
         # 1. Clean up old files to ensure we don't read stale data
         if os.path.exists(req_file):

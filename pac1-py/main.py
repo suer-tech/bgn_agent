@@ -16,6 +16,8 @@ from bitgn.harness_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
+from google.protobuf.json_format import MessageToDict
+
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 MODEL_ID = os.getenv("MODEL_ID") or "gpt-4.1-2025-04-14"
@@ -53,6 +55,67 @@ def run_task(
     return trace_logger
 
 
+def run_task_wrapper(task_info):
+    """Wrapper to run a single task with its own environment."""
+    import sys
+    import io
+    if sys.platform == "win32":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    
+    task, benchmark_id, bitgn_url, model_id = task_info
+    
+    # Set task ID in environment for providers/loggers
+    task_id = task["task_id"]
+    os.environ["PAC1_TASK_ID"] = task_id
+    
+    from bitgn.harness_connect import HarnessServiceClientSync
+    from bitgn.harness_pb2 import (
+        StartPlaygroundRequest,
+        EndTrialRequest,
+    )
+    
+    client = HarnessServiceClientSync(bitgn_url)
+    
+    print(f"{'=' * 30} Starting task: {task_id} {'=' * 30}", flush=True)
+    print(f"Requesting playground from BitGN for {task_id}...", flush=True)
+    
+    trial = client.start_playground(
+        StartPlaygroundRequest(
+            benchmark_id=benchmark_id,
+            task_id=task_id,
+        )
+    )
+
+    print(f"[{task_id}] Playground READY. Harness URL: {trial.harness_url}", flush=True)
+    
+    trace_logger = None
+    try:
+        trace_logger = run_task(
+            model_id,
+            trial.harness_url,
+            trial.instruction,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        print(f"[{task_id}] Error: {exc}")
+
+    result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+
+    if trace_logger is not None:
+        try:
+            score_detail_str = "\n".join(result.score_detail) if result.score_detail else ""
+            trace_logger.write_task_summary(
+                score=result.score if result.score >= 0 else None,
+                score_detail=score_detail_str,
+                error="" if result.score >= 0 else "Low score",
+            )
+        except Exception as e:
+            print(f"[{task_id}] Failed to write summary: {e}")
+
+    return task_id, result.score, list(result.score_detail)
+
+
 def main() -> None:
     # Force UTF-8 for Windows terminals
     if sys.platform == "win32":
@@ -60,7 +123,8 @@ def main() -> None:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-    task_filter = os.sys.argv[1:]
+    task_filter = sys.argv[1:]
+    parallel_limit = int(os.getenv("PAC1_PARALLEL_LIMIT", "1"))
 
     scores = []
     try:
@@ -79,63 +143,40 @@ def main() -> None:
             flush=True
         )
 
-        print(f"{CLI_BLUE}Running in STATE MACHINE mode{CLI_CLR}")
-
+        target_tasks = []
         for task in res.tasks:
             if task_filter and task.task_id not in task_filter:
                 continue
+            task_dict = MessageToDict(task, preserving_proto_field_name=True)
+            target_tasks.append((task_dict, BENCHMARK_ID, BITGN_URL, MODEL_ID))
 
-            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}", flush=True)
-            print(f"Requesting playground from BitGN for {task.task_id}...", flush=True)
-            
-            trial = client.start_playground(
-                StartPlaygroundRequest(
-                    benchmark_id=BENCHMARK_ID,
-                    task_id=task.task_id,
-                )
-            )
+        if not target_tasks:
+            print(f"{CLI_RED}No tasks found matching filter: {task_filter}{CLI_CLR}")
+            return
 
-            print(f"Playground READY. Harness URL: {trial.harness_url}", flush=True)
-            print(
-                f"{CLI_BLUE}INSTRUCTION:{CLI_CLR}\n{trial.instruction.encode('utf-8', errors='replace').decode('utf-8')}\n{'-' * 80}",
-                flush=True
-            )
+        print(f"{CLI_BLUE}Running {len(target_tasks)} tasks (Parallel: {parallel_limit}){CLI_CLR}")
 
-            trace_logger = None
-            try:
-                trace_logger = run_task(
-                    MODEL_ID,
-                    trial.harness_url,
-                    trial.instruction,
-                    task_id=task.task_id,
-                )
-            except Exception as exc:
-                print(exc)
+        if parallel_limit > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=parallel_limit) as executor:
+                results = list(executor.map(run_task_wrapper, target_tasks))
+                for task_id, score, score_detail in results:
+                    if score >= 0:
+                        scores.append((task_id, score))
+                        style = CLI_GREEN if score == 1 else CLI_RED
+                        explain = textwrap.indent("\n".join(score_detail), "  ")
+                        print(f"\n{CLI_BLUE}[{task_id}]{CLI_CLR} {style}Score: {score:0.2f}\n{explain}{CLI_CLR}")
+        else:
+            for task_info in target_tasks:
+                task_id, score, score_detail = run_task_wrapper(task_info)
+                if score >= 0:
+                    scores.append((task_id, score))
+                    style = CLI_GREEN if score == 1 else CLI_RED
+                    explain = textwrap.indent("\n".join(score_detail), "  ")
+                    print(f"\n{style}Score: {score:0.2f}\n{explain}\n{CLI_CLR}")
 
-            result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-
-            # Write task summary with score
-            if trace_logger is not None:
-                try:
-                    score_detail_str = (
-                        chr(10).join(result.score_detail) if result.score_detail else ""
-                    )
-                    trace_logger.write_task_summary(
-                        score=result.score if result.score >= 0 else None,
-                        score_detail=score_detail_str,
-                        error="" if result.score >= 0 else "Low score",
-                    )
-                except Exception as e:
-                    print(f"Failed to write summary: {e}")
-
-            if result.score >= 0:
-                scores.append((task.task_id, result.score))
-                style = CLI_GREEN if result.score == 1 else CLI_RED
-                explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}\n{explain}\n{CLI_CLR}")
-
-    except ConnectError as exc:
-        print(f"{exc.code}: {exc.message}")
+    except Exception as exc:
+        print(f"Main Loop Error: {exc}")
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 

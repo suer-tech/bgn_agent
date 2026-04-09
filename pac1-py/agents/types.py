@@ -71,15 +71,108 @@ SYSTEM_DIRECTORIES = {
 # State Machine: Scratchpad Memory
 # =============================================================================
 
+class TrackedEntity(BaseModel):
+    """A single entity discovered during execution, with its resolution status."""
+    entity_type: str = Field(
+        ..., description="Type: account, contact, manager, invoice, reminder, opportunity, message, file",
+    )
+    identifier: str = Field(
+        ..., description="Human-readable identifier: name, email, or ID (e.g., 'Matthias Schuster', 'acct_007')",
+    )
+    resolved_file: Optional[str] = Field(
+        default=None,
+        description="Path to the authoritative record file (e.g., 'contacts/mgr_002.json'). None if not yet resolved.",
+    )
+    status: Literal["resolved", "unresolved", "not_applicable"] = Field(
+        default="unresolved",
+        description=(
+            "resolved = authoritative file found and read. "
+            "unresolved = entity mentioned but record not yet located. "
+            "not_applicable = no separate record exists for this entity."
+        ),
+    )
+    depends_on: List[str] = Field(
+        default_factory=list,
+        description="Identifiers of other entities this one depends on (e.g., contact depends on account)",
+    )
+
+
+# =============================================================================
+# Strategic Analysis: Pre-execution planning
+# =============================================================================
+
+class VerificationItem(BaseModel):
+    """A single check that must pass before task completion."""
+    check: str = Field(..., description="What to verify (e.g., 'sender email matches contact record')")
+    source_rule: str = Field(..., description="FILE: /path — RULE: quote that requires this check")
+    status: Literal["pending", "passed", "failed", "skipped"] = Field(
+        default="pending", description="Updated during execution as checks are performed",
+    )
+
+
+class Risk(BaseModel):
+    """A potential issue to watch for during execution."""
+    description: str = Field(..., description="What could go wrong (e.g., 'contact may request data from another account')")
+    mitigation: str = Field(..., description="How to handle it (e.g., 'verify sender account_id matches requested account')")
+    source_rule: str = Field(..., description="FILE: /path — RULE: quote")
+
+
+class ScopeBoundary(BaseModel):
+    """What the agent is and isn't allowed to touch."""
+    files_may_create: List[str] = Field(default_factory=list, description="Glob patterns of files agent may create (e.g., 'outbox/*.json')")
+    files_may_modify: List[str] = Field(default_factory=list, description="Glob patterns of files agent may modify (e.g., 'outbox/seq.json')")
+    files_must_not_touch: List[str] = Field(default_factory=list, description="Files/patterns agent must NOT modify or delete")
+    reasoning: str = Field(default="", description="Why these boundaries")
+
+
+class StrategicAnalysis(BaseModel):
+    """Pre-execution analysis — think before you act."""
+    predicted_entities: List[TrackedEntity] = Field(
+        default_factory=list,
+        description="All entities the task will likely involve, with predicted dependencies. Mark all as 'unresolved' initially.",
+    )
+    verification_checklist: List[VerificationItem] = Field(
+        default_factory=list,
+        description="Checks that MUST pass before reporting completion. Derived from workspace rules and task requirements.",
+    )
+    risks: List[Risk] = Field(
+        default_factory=list,
+        description="Potential issues to watch for, with mitigations derived from workspace rules.",
+    )
+    scope_boundary: ScopeBoundary = Field(
+        default_factory=ScopeBoundary,
+        description="What files the agent is allowed to create/modify/must-not-touch.",
+    )
+    execution_approach: str = Field(
+        default="",
+        description="Brief description of the planned approach (2-3 sentences).",
+    )
+
+
+class PreCompletionReview(BaseModel):
+    """Final review before sending answer to benchmark."""
+    all_entities_resolved: bool = Field(..., description="Are all entities in entity_graph resolved?")
+    checklist_passed: bool = Field(..., description="Are all verification_checklist items passed?")
+    scope_respected: bool = Field(..., description="Were scope boundaries respected?")
+    approved: bool = Field(..., description="Overall: is the answer ready to submit?")
+    issues: List[str] = Field(default_factory=list, description="List of issues if not approved")
+
+
 class ScratchpadState(BaseModel):
     """Agent's working memory — persisted between execution loop iterations."""
     current_goal: str = Field(
         default="",
         description="Какую подзадачу мы решаем прямо сейчас?",
     )
-    found_entities: Dict[str, Union[str, List[str]]] = Field(
-        default_factory=dict,
-        description="Кэш найденных данных: ID, email, пути. Формат: {'Alex Meyer email': ['alex@example.com']}",
+    entity_graph: List[TrackedEntity] = Field(
+        default_factory=list,
+        description=(
+            "MANDATORY: track ALL entities discovered during execution. "
+            "Every person, account, record, or file mentioned in the task or found during execution "
+            "must be added here. Each entity must be resolved to its authoritative file before task completion. "
+            "If an entity has dependencies (e.g., account_manager → contact record), add those too. "
+            "At report_completion, ALL resolved_file paths become grounding_refs."
+        ),
     )
     missing_info: str = Field(
         default="",
@@ -95,7 +188,7 @@ class ScratchpadState(BaseModel):
     )
     current_workflow: Optional[str] = Field(
         default=None,
-        description="Current active workflow (e.g., 'INBOX_PROCESS_LOWEST')",
+        description="Current active workflow",
     )
 
 
@@ -155,6 +248,18 @@ class TriageDecision(BaseModel):
     reason: str
 
 
+class ContextAdvice(BaseModel):
+    """LLM advice on which additional instruction files to pre-load."""
+    additional_paths: List[str] = Field(
+        default_factory=list,
+        description="Paths to instruction/rule files that should be pre-loaded for the executor",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief explanation of why these files are needed",
+    )
+
+
 # =============================================================================
 # State Machine: Main Agent State
 # =============================================================================
@@ -171,12 +276,28 @@ class TaskModel(BaseModel):
     terminal_mode_candidate: Optional[str] = None
 
 
+class TriageAndTaskModel(BaseModel):
+    """Combined triage + task extraction in one LLM call."""
+    # Triage fields
+    is_safe: bool
+    intent: IntentType
+    reason: str
+    # Task model fields
+    domain: DomainType = Field(default=DomainType.GENERAL)
+    requested_effect: str = Field(default="unknown")
+    target_entities: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    ambiguity_high: bool = False
+    security_risk_high: bool = False
+
+
 class AgentState(TypedDict):
     task_text: str                                # Оригинальный запрос <user_input>
     triage_result: Optional[TriageDecision]
     task_model: Optional[TaskModel]               # New: structured task model
     workspace_rules: Dict[str, str]               # Legacy: flat rules for backward compatibility
     authority_map: AuthorityMap                   # New: hierarchical rules
+    strategic_analysis: Optional[StrategicAnalysis]  # Pre-execution planning
     scratchpad: ScratchpadState                    # Оперативная память агента
     entity_context: str                           # Pre-gathered context for target entities
     conversation_history: List[dict]               # Лог LLM-вызовов
@@ -296,15 +417,70 @@ class SubagentResult(BaseModel):
     grounding_refs: List[str] = Field(default_factory=list)
 
 
+class MutationPlan(BaseModel):
+    """Declared before any write/delete/move — what exactly will be changed and why."""
+    target_file: str = Field(
+        ..., description="Exact path of the file to be modified/created/deleted",
+    )
+    action: Literal["write", "delete", "move", "mkdir"] = Field(
+        ..., description="What operation will be performed",
+    )
+    why_this_file: str = Field(
+        ..., description="Why THIS specific file (cite the rule or data that identified it as the target)",
+    )
+    similar_files_not_touched: List[str] = Field(
+        default_factory=list,
+        description="List similar/related files that will NOT be modified and why (e.g., 'lane_b.json — shadow lane, docs say prefer downstream emitter')",
+    )
+
+
+class RuleCitation(BaseModel):
+    """Structured citation of the rule that justifies a decision."""
+    source_file: str = Field(
+        ..., description="Exact path of the file containing the rule (e.g., /reminders/README.MD)",
+    )
+    source_type: Literal[
+        "SYSTEM_PROMPT",   # this system prompt meta-rules
+        "ROOT_AGENTS_MD",  # root AGENTS.md
+        "README_INVARIANT", # README.md invariant (hard rule, must not be violated)
+        "PROCESS_DOC",     # docs/*.md process documentation
+        "NESTED_AGENTS_MD", # nested AGENTS.md in subfolder
+        "DATA_HINT",       # data file containing a suggestion/candidate/hint (lowest authority)
+    ] = Field(
+        ..., description="Authority level of this source. README_INVARIANT > PROCESS_DOC > DATA_HINT.",
+    )
+    rule_quote: str = Field(
+        ..., description="Exact quote or close summary of the rule from the source file",
+    )
+
+
 class NextStep(BaseModel):
     current_state: str
     plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(8)] = Field(
         ...,
         description="briefly explain the next useful steps",
     )
+    decision_justification: RuleCitation = Field(
+        ...,
+        description=(
+            "MANDATORY for EVERY step. Cite the rule that justifies this decision. "
+            "Pick the HIGHEST-authority source that applies. "
+            "If a README_INVARIANT says 'keep X and Y aligned' but a DATA_HINT says 'update only X' — "
+            "the invariant wins, you MUST update both. "
+            "If no documented rule exists for a restriction — the restriction does not exist. Act accordingly."
+        ),
+    )
     scratchpad_update: ScratchpadState = Field(
         default_factory=ScratchpadState,
         description="Обновлённая памятка агента. Записывай найденные ID в found_entities!",
+    )
+    mutation_plan: Optional[MutationPlan] = Field(
+        default=None,
+        description=(
+            "REQUIRED when function is write/delete/move/mkdir. "
+            "Declare WHAT you will change, WHY this file, and which similar files you will NOT touch. "
+            "Omit only for read-only operations (read, list, search, tree, find)."
+        ),
     )
     task_completed: bool
     subagent_delegation: Optional[SubagentTask] = Field(

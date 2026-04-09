@@ -272,8 +272,9 @@ def _extract_search_term(entity: str) -> str:
 def _extract_cross_refs(content: str) -> List[str]:
     """Extract file paths for cross-referenced records from JSON content.
 
-    Follows ID references like primary_contact_id, contact_id, account_id
-    to their corresponding files in the known folder structure.
+    Generic: any field ending with _id is treated as a potential reference.
+    Derives the folder from the field name (e.g., contact_id → contacts/,
+    account_id → accounts/, primary_contact_id → contacts/).
     """
     try:
         data = json.loads(content)
@@ -281,18 +282,20 @@ def _extract_cross_refs(content: str) -> List[str]:
         return []
 
     paths = []
-    ref_map = {
-        "primary_contact_id": "contacts/{}.json",
-        "contact_id": "contacts/{}.json",
-        "account_id": "accounts/{}.json",
-        "account_manager_id": "contacts/{}.json",
-    }
 
     if isinstance(data, dict):
-        for field_name, path_template in ref_map.items():
-            val = data.get(field_name)
-            if val and isinstance(val, str):
-                paths.append(path_template.format(val))
+        for field_name, val in data.items():
+            if not field_name.endswith("_id") or not isinstance(val, str) or not val:
+                continue
+            # Derive folder name from field: remove trailing _id, remove prefix qualifiers
+            # e.g., "primary_contact_id" → "contact" → "contacts/"
+            # e.g., "account_id" → "account" → "accounts/"
+            parts = field_name.replace("_id", "").split("_")
+            # Take the last meaningful part (handles "primary_contact" → "contact")
+            entity_type = parts[-1] if parts else ""
+            if entity_type:
+                folder = f"{entity_type}s"  # pluralize
+                paths.append(f"{folder}/{val}.json")
 
     return paths
 

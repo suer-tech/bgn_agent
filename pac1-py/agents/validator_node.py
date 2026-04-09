@@ -4,7 +4,7 @@ Runs after any 'write', 'delete', or 'move' operation to ensure the repository r
 """
 
 from typing import List, Optional
-from agents.types import AgentState, TaskModel, DomainType
+from agents.types import AgentState, TaskModel
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from agents.pcm_helpers import safe_read_file
 from llm_logger import LLMTraceLogger
@@ -21,33 +21,30 @@ def run_post_mutation_validation(
     """
     warnings = []
     task_model = state.get("task_model")
-    domain = task_model.domain if task_model else DomainType.GENERAL
-    
+
     tool_name = last_tool_call.get("name")
     args = last_tool_call.get("arguments", {})
-    
-    # 1. CRM Invariants: outbox + seq.json
-    if domain == DomainType.TYPED_CRM and tool_name == "write":
-        path = args.get("path", "")
-        if "outbox/" in path:
-            # Check if seq.json exists and if it was read or updated recently
-            # Ideally, we should check if it was updated, but for now we look for it.
-            seq_content = safe_read_file(vm_client, "outbox/seq.json")
-            if seq_content is None:
-                warnings.append("CRM Warning: outbox/seq.json is missing but a new email was written.")
-            
-    # 2. Minimal Diff: check if the path is related to the task
+
+    # Universal: check if modified path relates to the task
     if task_model and tool_name in ("write", "delete"):
         target_path = args.get("path", "")
-        # Very crude check: is the path mentioned in the task or domain?
         is_relevant = False
+
+        # Check if any target entity appears in the path
         if any(entity.lower() in target_path.lower() for entity in task_model.target_entities):
             is_relevant = True
-        if domain == DomainType.TYPED_CRM and any(p in target_path for p in ("contacts", "accounts", "outbox", "invoices")):
-            is_relevant = True
-        if domain in (DomainType.KNOWLEDGE_REPO, DomainType.INBOX_WORKFLOW) and any(p in target_path for p in ("00_inbox", "01_capture", "02_distill", "90_memory", "99_process")):
-            is_relevant = True
-            
+
+        # Check if the path is in a directory mentioned in workspace rules
+        ws_rules = state.get("workspace_rules", {})
+        for rule_path in ws_rules:
+            if rule_path == "tree_process":
+                continue
+            # If the rule is about a directory that contains the target path
+            rule_dir = "/".join(rule_path.split("/")[:-1]).lstrip("/")
+            if rule_dir and rule_dir in target_path:
+                is_relevant = True
+                break
+
         if not is_relevant and "AGENTS.md" not in target_path:
             warnings.append(f"Minimal Diff Warning: Modification of '{target_path}' seems unrelated to the task.")
 

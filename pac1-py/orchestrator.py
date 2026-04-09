@@ -3,14 +3,17 @@
 Flow:
 1. Initialize AgentState
 2. Triage (1 LLM call) → early exit if ATTACK/UNSUPPORTED
-3. Bootstrap (0 LLM calls) → load workspace rules via regex
-4. Execution Loop (max 30 steps):
+3. Bootstrap (1 LLM call) → load workspace rules
+4. Task Extraction (1 LLM call) → structured task model
+5. Strategic Analysis (1 LLM call) → entity graph, checklist, risks, scope
+6. Execution Loop (max 30 steps):
    a. build_planner_prompt() + plan_next_step()
-   b. Update Scratchpad from LLM response
-   c. If report_completion → break
+   b. Update Scratchpad + entity graph
+   c. If report_completion → check entities + checklist → break or feedback
    d. execute_tool() → add to conversation_history
-5. Send AnswerRequest to PCM (ONLY here!)
-6. Log everything
+7. Pre-Completion Review (1 LLM call) → verify before submitting
+8. Send AnswerRequest to PCM (ONLY here!)
+9. Log everything
 """
 
 import json
@@ -29,6 +32,7 @@ from agents.types import (
 from agents.triage_node import run_triage
 from agents.bootstrap_node import run_bootstrap
 from agents.task_node import run_task_extraction
+from agents.strategic_analysis_node import run_strategic_analysis
 from agents.context_gatherer import gather_entity_context, format_gathered_context
 from agents.security_node import run_post_context_security
 from agents.validator_node import run_post_mutation_validation
@@ -95,6 +99,7 @@ class Orchestrator:
             "task_model": None,
             "workspace_rules": {},
             "authority_map": AuthorityMap(),
+            "strategic_analysis": None,
             "scratchpad": ScratchpadState(),
             "entity_context": "",
             "conversation_history": [],
@@ -120,10 +125,22 @@ class Orchestrator:
             print(f"{CLI_YELLOW}Could not get sandbox date: {e}{CLI_CLR}")
 
         # =====================================================================
-        # Step 2: Triage (1 LLM call)
+        # Step 1b: Quick tree for triage context (0 LLM calls)
         # =====================================================================
-        print(f"{CLI_YELLOW}[1/3] Triage — classifying request...{CLI_CLR}", flush=True)
-        state = run_triage(state, self.provider, self.trace_logger)
+        workspace_tree = ""
+        try:
+            from bitgn.vm.pcm_pb2 import TreeRequest
+            from agents.pcm_helpers import format_tree
+            tree_result = vm.tree(TreeRequest(root="/", level=2))
+            workspace_tree = format_tree({"root": "/", "level": 2}, tree_result)
+        except Exception:
+            pass
+
+        # =====================================================================
+        # Step 2: Triage (1 LLM call) — with workspace tree for capability awareness
+        # =====================================================================
+        print(f"{CLI_YELLOW}[1/5] Triage — classifying request...{CLI_CLR}", flush=True)
+        state = run_triage(state, self.provider, self.trace_logger, workspace_tree=workspace_tree)
 
         if state["is_completed"]:
             outcome = state["final_outcome"]
@@ -132,7 +149,6 @@ class Orchestrator:
             )
             print(f"{CLI_RED}TRIAGE BLOCKED: {outcome} — {reason}{CLI_CLR}")
 
-            # Send answer to PCM
             try:
                 send_answer(vm, f"Request blocked by triage: {reason}", outcome)
             except Exception as e:
@@ -146,10 +162,10 @@ class Orchestrator:
         )
 
         # =====================================================================
-        # Step 3: Bootstrap (0 LLM calls)
+        # Step 3: Bootstrap (1 LLM call for context advisor)
         # =====================================================================
-        print(f"{CLI_YELLOW}[2/3] Bootstrap — loading workspace rules...{CLI_CLR}")
-        state = run_bootstrap(state, vm, self.trace_logger)
+        print(f"{CLI_YELLOW}[2/5] Bootstrap — loading workspace rules...{CLI_CLR}")
+        state = run_bootstrap(state, vm, self.trace_logger, llm_provider=self.provider)
 
         rules_count = len(state["workspace_rules"])
         print(f"{CLI_GREEN}Loaded {rules_count} rule files{CLI_CLR}")
@@ -157,9 +173,9 @@ class Orchestrator:
             print(f"  [Rule] {path}")
 
         # =====================================================================
-        # Step 4: Structured Task Extraction (1 LLM call)
+        # Step 4: Task Extraction (1 LLM call)
         # =====================================================================
-        print(f"{CLI_YELLOW}[3/4] Task Model — extracting structure...{CLI_CLR}")
+        print(f"{CLI_YELLOW}[3/5] Task Model — extracting structure...{CLI_CLR}")
         state = run_task_extraction(state, self.provider, self.trace_logger)
 
         model = state["task_model"]
@@ -195,7 +211,42 @@ class Orchestrator:
             return self._build_result(state, task_id, start_time, 0)
 
         # =====================================================================
-        # Step 5b: Entity Context Gathering (deterministic, no LLM)
+        # Step 5b: Strategic Analysis (1 LLM call)
+        # =====================================================================
+        print(f"{CLI_YELLOW}[4a/6] Strategic Analysis — thinking before acting...{CLI_CLR}")
+        state = run_strategic_analysis(state, self.provider, self.trace_logger)
+
+        sa = state["strategic_analysis"]
+        if sa:
+            print(f"{CLI_GREEN}Strategic Analysis:{CLI_CLR}")
+            print(f"  Entities: {len(sa.predicted_entities)} predicted")
+            print(f"  Checklist: {len(sa.verification_checklist)} items")
+            print(f"  Risks: {len(sa.risks)} identified")
+            print(f"  Scope: create={sa.scope_boundary.files_may_create}, must_not_touch={sa.scope_boundary.files_must_not_touch}")
+            print(f"  Approach: {sa.execution_approach[:150]}")
+
+            # Check for irreconcilable contradictions in risks/checklist
+            contradiction_risks = [
+                r for r in sa.risks
+                if "contradict" in r.description.lower() or "irreconcilable" in r.description.lower()
+            ]
+            contradiction_checks = [
+                v for v in sa.verification_checklist
+                if "contradict" in v.check.lower() and v.status == "failed"
+            ]
+            if contradiction_risks or contradiction_checks:
+                reason = contradiction_risks[0].description if contradiction_risks else contradiction_checks[0].check
+                print(f"{CLI_RED}STRATEGIC BLOCK: Contradiction detected — {reason}{CLI_CLR}")
+                state["final_outcome"] = "OUTCOME_NONE_CLARIFICATION"
+                state["is_completed"] = True
+                send_answer(vm, f"Cannot proceed: {reason}", state["final_outcome"])
+                return self._build_result(state, task_id, start_time, 0)
+
+            # Initialize scratchpad entity_graph from predicted entities
+            state["scratchpad"].entity_graph = list(sa.predicted_entities)
+
+        # =====================================================================
+        # Step 5c: Entity Context Gathering (deterministic, no LLM)
         # =====================================================================
         if model.target_entities:
             print(f"{CLI_YELLOW}[4a/4] Gathering entity context...{CLI_CLR}")
@@ -224,6 +275,13 @@ class Orchestrator:
         final_answer = ""
         grounding_refs = []
         completed_steps = []
+        sequential_read_dirs = {}  # dir -> count of sequential reads
+        read_source_files = set()  # files agent has read (for delete protection)
+        inbox_messages_read = set()  # distinct inbox msg files read (for one-at-a-time)
+
+        # Pre-compute: does task text explicitly request deletion?
+        task_lower = state["task_text"].lower()
+        task_allows_delete = any(w in task_lower for w in ("delete", "remove", "discard", "clean up", "clean-up"))
 
         for iteration in range(max_iterations):
             step_name = f"step_{iteration + 1}"
@@ -252,6 +310,9 @@ class Orchestrator:
 
             print(f"  📝 Goal: {next_step.scratchpad_update.current_goal[:100]}")
             print(f"  📋 Plan: {next_step.plan_remaining_steps_brief[0]}")
+            cit = next_step.decision_justification
+            if cit:
+                print(f"  📖 [{cit.source_type}] {cit.source_file} — {cit.rule_quote[:120]}")
 
             # 4c. Delegate to Subagent (check BEFORE completion — LLM may return both)
             if next_step.subagent_delegation:
@@ -282,8 +343,53 @@ class Orchestrator:
                 tool_name = f"subagent_{task.subagent_id}"
                 tool_args = task.model_dump()
             elif isinstance(next_step.function, ReportTaskCompletion):
+                # --- Check for unresolved entities before accepting completion ---
+                entity_graph = next_step.scratchpad_update.entity_graph
+                unresolved = [
+                    e for e in entity_graph
+                    if e.status == "unresolved"
+                ]
+                if unresolved and next_step.function.outcome == "OUTCOME_OK":
+                    unresolved_names = ", ".join(
+                        f"{e.entity_type}:{e.identifier}" for e in unresolved
+                    )
+                    print(f"{CLI_YELLOW}  [Entity Check] Unresolved entities: {unresolved_names}{CLI_CLR}")
+                    # Feed back to LLM instead of completing
+                    result_text = (
+                        f"[SYSTEM FEEDBACK]: You have unresolved entities in your entity_graph: {unresolved_names}. "
+                        f"Each entity must be resolved to its authoritative file before reporting completion. "
+                        f"Read the missing records and update entity_graph, then try report_completion again."
+                    )
+                    tool_name = "report_completion"
+                    tool_args = next_step.function.model_dump()
+                    state["scratchpad"] = next_step.scratchpad_update
+                    state["conversation_history"].append(
+                        {"role": "assistant", "content": next_step.current_state,
+                         "tool_calls": [{"type": "function", "id": step_name,
+                                         "function": {"name": "report_completion",
+                                                      "arguments": next_step.function.model_dump_json()}}]}
+                    )
+                    state["conversation_history"].append(
+                        {"role": "tool", "content": result_text, "tool_call_id": step_name}
+                    )
+                    continue
+
+                # --- Build grounding_refs from entity_graph + LLM refs ---
+                entity_refs = [
+                    e.resolved_file for e in entity_graph
+                    if e.resolved_file and e.status == "resolved"
+                ]
+                llm_refs = next_step.function.grounding_refs or []
+                # Merge: entity graph refs + LLM refs, deduplicated, preserving order
+                seen = set()
+                grounding_refs = []
+                for ref in entity_refs + llm_refs:
+                    normalized = ref.lstrip("/")
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        grounding_refs.append(normalized)
+
                 final_answer = next_step.function.message
-                grounding_refs = next_step.function.grounding_refs
                 completed_steps = next_step.function.completed_steps_laconic
                 state["final_outcome"] = next_step.function.outcome
                 state["is_completed"] = True
@@ -295,6 +401,8 @@ class Orchestrator:
                 )
                 print(f"{status}TASK COMPLETED: {next_step.function.outcome}{CLI_CLR}")
                 print(f"Summary: {final_answer}")
+                if entity_graph:
+                    print(f"  Entity graph: {len(entity_graph)} entities ({len(entity_refs)} resolved)")
                 if grounding_refs:
                     print(f"References: {', '.join(grounding_refs)}")
                 break
@@ -306,6 +414,17 @@ class Orchestrator:
                 tool_args.pop("tool", None)
 
                 tool_call = {"name": tool_name, "arguments": tool_args}
+
+                # ----- Mutation plan check -----
+                if tool_name in ("write", "delete", "move", "mkdir"):
+                    mp = next_step.mutation_plan
+                    if mp:
+                        print(f"  📋 Mutation: {mp.action} {mp.target_file}")
+                        print(f"     Why: {mp.why_this_file[:120]}")
+                        if mp.similar_files_not_touched:
+                            print(f"     Not touching: {', '.join(mp.similar_files_not_touched)[:150]}")
+                    else:
+                        print(f"{CLI_YELLOW}  [Guardrail] Mutation without mutation_plan!{CLI_CLR}")
 
                 print(
                     f"  (Tool) {tool_name}: {json.dumps(tool_args, ensure_ascii=False)[:200]}"
@@ -337,6 +456,83 @@ class Orchestrator:
                     state["is_completed"] = True
                     final_answer = f"Security block: {security_check.reason}"
                     break
+
+            # ----- Step 4e2: Track reads + sequential read guardrail -----
+            if tool_name in ("read", "cat"):
+                read_path = tool_args.get("path", "").strip("/")
+                # Track source files for delete protection (#1)
+                read_source_files.add(read_path)
+                # Track inbox messages for one-at-a-time (#2)
+                if ("inbox" in read_path.lower() and
+                        read_path.split("/")[-1].startswith("msg_")):
+                    inbox_messages_read.add(read_path)
+                    if len(inbox_messages_read) > 1:
+                        result_text += (
+                            "\n\n[SYSTEM FEEDBACK]: You have read "
+                            f"{len(inbox_messages_read)} distinct inbox messages. "
+                            "Workspace rules say 'handle one item at a time'. "
+                            "Stop processing and report_completion for the first message."
+                        )
+                        print(f"{CLI_YELLOW}  [Guardrail] Multiple inbox messages read: {inbox_messages_read}{CLI_CLR}")
+                # Sequential read guardrail
+                read_dir = "/".join(read_path.split("/")[:-1])
+                if read_dir:
+                    sequential_read_dirs[read_dir] = sequential_read_dirs.get(read_dir, 0) + 1
+                    if sequential_read_dirs[read_dir] >= 4:
+                        result_text += (
+                            "\n\n[SYSTEM FEEDBACK]: You have read 4+ files from '"
+                            + read_dir + "'. Use `search` instead of reading one by one."
+                        )
+                        print(f"{CLI_YELLOW}  [Guardrail] 4+ reads from {read_dir}{CLI_CLR}")
+            else:
+                sequential_read_dirs.clear()
+
+            # ----- Step 4e3: Delete protection — MINIMAL DIFF (#1) -----
+            if tool_name == "delete":
+                delete_path = tool_args.get("path", "").strip("/")
+                if delete_path in read_source_files and not task_allows_delete:
+                    result_text = (
+                        f"[SYSTEM BLOCK]: Cannot delete '{delete_path}' — "
+                        "this file was read as input data, and the task does NOT "
+                        "explicitly request deletion (no 'delete'/'remove'/'discard' in task text). "
+                        "MINIMAL DIFF rule: source files must not be deleted after processing."
+                    )
+                    print(f"{CLI_RED}  [Guardrail] DELETE BLOCKED: {delete_path} (source file, task has no delete keyword){CLI_CLR}")
+
+            # ----- Step 4e4: Scope boundary alert (#3) -----
+            if tool_name in ("write", "delete", "move") and sa:
+                target = tool_args.get("path", "").strip("/")
+                must_not = sa.scope_boundary.files_must_not_touch
+                scope_violation = False
+                for pattern in must_not:
+                    pattern_clean = pattern.strip("/")
+                    if pattern_clean.endswith("*"):
+                        if target.startswith(pattern_clean.rstrip("*")):
+                            scope_violation = True
+                            break
+                    elif target == pattern_clean or target.endswith("/" + pattern_clean):
+                        scope_violation = True
+                        break
+                if scope_violation:
+                    result_text += (
+                        f"\n\n[SCOPE ALERT]: You are modifying '{target}' which is in the "
+                        f"MUST_NOT_TOUCH list from strategic analysis: {must_not}. "
+                        "Are you SURE this modification is required by the task? "
+                        "If not, undo this action and proceed without it."
+                    )
+                    print(f"{CLI_YELLOW}  [Guardrail] SCOPE ALERT: {target} in must_not_touch{CLI_CLR}")
+
+            # ----- Step 4e5: RuleCitation authority check (#4) -----
+            if tool_name in ("write", "delete", "move", "mkdir"):
+                cit = next_step.decision_justification
+                if cit and cit.source_type == "DATA_HINT":
+                    result_text += (
+                        "\n\n[AUTHORITY ALERT]: Your decision_justification cites a DATA_HINT "
+                        f"('{cit.source_file}') for a mutation. DATA_HINT has the LOWEST authority. "
+                        "Check if a README_INVARIANT or PROCESS_DOC contradicts this. "
+                        "If a higher-authority rule exists, follow it instead."
+                    )
+                    print(f"{CLI_YELLOW}  [Guardrail] DATA_HINT used for mutation — authority alert{CLI_CLR}")
 
             # ----- Step 4f: Post-mutation Invariant Validation -----
             if tool_name in ("write", "delete", "move", "mkdir"):
@@ -391,7 +587,31 @@ class Orchestrator:
             print(f"{CLI_RED}TIMEOUT: {final_answer}{CLI_CLR}")
 
         # =====================================================================
-        # Step 5: Send AnswerRequest to PCM (ONLY here!)
+        # Step 7: Pre-Completion Review (1 LLM call)
+        # =====================================================================
+        if state["is_completed"] and state["final_outcome"] == "OUTCOME_OK":
+            # Code-based pre-completion review (0 LLM calls)
+            review_issues = []
+            entity_graph = state["scratchpad"].entity_graph
+            unresolved = [e for e in entity_graph if e.status == "unresolved"]
+            if unresolved:
+                review_issues.append(
+                    f"Unresolved entities: {', '.join(e.identifier for e in unresolved)}"
+                )
+            sa = state.get("strategic_analysis")
+            if sa:
+                pending = [v for v in sa.verification_checklist if v.status == "pending"]
+                if pending:
+                    review_issues.append(
+                        f"Pending checklist items: {', '.join(v.check for v in pending[:3])}"
+                    )
+            if review_issues:
+                print(f"{CLI_YELLOW}[Review] ISSUES: {'; '.join(review_issues)}{CLI_CLR}")
+            else:
+                print(f"{CLI_GREEN}[Review] APPROVED (code check){CLI_CLR}")
+
+        # =====================================================================
+        # Step 8: Send AnswerRequest to PCM (ONLY here!)
         # =====================================================================
         try:
             send_answer(
