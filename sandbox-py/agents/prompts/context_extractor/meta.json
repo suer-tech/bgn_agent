@@ -1,0 +1,61 @@
+{
+  "current_version": 8,
+  "versions": [
+    {
+      "version_id": 1,
+      "score": null,
+      "parent_version_id": 0,
+      "changes_summary": "Added explicit instructions to extract and prioritize critical references like README.md and AGENTS.MD. Implemented verification steps to cross-check mandatory references before task execution. Enhanced extraction of nested AGENTS.MD files and project rules. Added instructions to prevent duplication in file change listings. Strengthened path extraction and tracking for consistency and correctness. Included checks to ensure the extracted context matches expected output files and formats. Clarified workspace structure extraction to avoid sensitive paths while capturing necessary files.",
+      "created_at": "2026-03-30T16:40:34.847167"
+    },
+    {
+      "version_id": 2,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added generic validation steps to ensure all required critical references (e.g., AGENTS.MD, README.md, CLAUDE.MD) are identified, extracted, and verified before proceeding. Included verification of file existence and protection status to respect access rules. Enhanced recursive extraction of policy documents with structured, priority-based approaches beyond basic file searches. Strengthened universal application of protection rules to avoid unauthorized access to files like AGENTS.MD. Introduced explicit error or warning flags for missing mandatory references early in the process. Preserved original responsibilities like deduplication, user profile extraction, and workspace structure accuracy.",
+      "created_at": "2026-03-30T16:51:47.256827"
+    },
+    {
+      "version_id": 3,
+      "score": null,
+      "parent_version_id": 2,
+      "changes_summary": "Introduced a generic, extensible validation mechanism to ensure all required policy and reference files are identified based on task references and context without hardcoding paths. Enhanced the prompt to detect contextually relevant mandatory documentation, such as cleanup policies for cleanup tasks. Improved the extraction approach to combine structured path/prioritization with contextual inference for comprehensive document coverage. Added stronger verification to flag missing critical references early. Retained all existing strengths and protections.",
+      "created_at": "2026-03-30T17:09:34.001178"
+    },
+    {
+      "version_id": 4,
+      "score": null,
+      "parent_version_id": 3,
+      "changes_summary": "Added explicit detection and handling of protected or inaccessible files to avoid direct access attempts. Introduced fallback and summarization mechanisms when files cannot be accessed. Integrated policy-aware and security-respecting extraction to prevent blocking on protected resources. Enhanced verification to flag missing or inaccessible references early with fallback strategies. Maintained all existing features such as recursive extraction, deduplication, and path accuracy.",
+      "created_at": "2026-03-30T17:28:43.816549"
+    },
+    {
+      "version_id": 5,
+      "score": null,
+      "parent_version_id": 4,
+      "changes_summary": "- Added explicit instruction to consolidate and merge rules from duplicate or similarly named policy files (e.g., AGENTS.MD and AGENTS.md) to avoid redundant reads and confusion.\n- Introduced a generic, policy-based enforcement requiring no side-effecting actions if required data (like 'amount') is missing, preventing unintended actions.\n- Enhanced verification to confirm that constraints preventing actions in missing-data scenarios are extracted and enforced, rather than relying on heuristics.\n- Maintained generic, extensible rules without task-specific hardcoding.\n- Kept all previously existing strengths such as recursive extraction, deduplication, and protection rule compliance.",
+      "created_at": "2026-03-30T17:42:33.325663"
+    },
+    {
+      "version_id": 6,
+      "score": null,
+      "parent_version_id": 5,
+      "changes_summary": "1. Added systematic fallback verification to ensure no required policy files (e.g., RULES.md in workspace/) are omitted prior to execution.\n2. Enhanced extraction rules to identify and include explicit or contextually referenced important policy documents beyond AGENTS.MD, such as RULES.md and others in key directories.\n3. Improved generic, context-driven policy file detection to avoid missing critical documentation without hardcoding specific filenames or paths.\n4. Reinforced enforcement of constraints preventing side-effecting actions if essential parameters are absent, strictly based on extracted rules.\n5. Maintained strengths like recursive extraction, deduplication, path consistency, protection enforcement, and generic applicability across tasks.",
+      "created_at": "2026-03-30T17:44:00.450083"
+    },
+    {
+      "version_id": 7,
+      "score": null,
+      "parent_version_id": 6,
+      "changes_summary": "1. Expanded policy extraction to include 'ops/' directory and other relevant folders as potential locations for critical policy files.\n2. Added 'retention.md' and similarly important files to the set of mandatory references to check for extraction and validation.\n3. Introduced universal fallback checks ensuring no critical policy or rules files are omitted before execution, generalizing beyond specific hardcoded files.\n4. Enforced stricter validation that extracted rules must include constraints preventing any side-effecting actions if essential data or parameters are missing.\n5. Clarified and generalized policy extraction logic to not rely solely on AGENTS.MD but also other relevant files referenced directly or via context.\n6. Maintained all prior strengths such as recursive extraction, protection enforcement, deduplication, and accurate path handling.\n7. Added FIXED comments documenting these improvements explicitly in the prompt text.",
+      "created_at": "2026-03-30T18:04:39.624499"
+    },
+    {
+      "version_id": 8,
+      "score": null,
+      "parent_version_id": 7,
+      "changes_summary": "Added new universal rules and validations to ensure that all mandatory referenced policy and rules files, especially those implied or located in typical directories like 'ops/', are always identified, extracted, incorporated, and explicitly mentioned in reasoning and final outputs. Introduced fallback checks prior to execution to confirm that no critical policy files are omitted. Enhanced enforcement that no side-effecting actions are permitted when essential inputs are missing, strictly based on extracted context. Maintained existing strengths such as recursive extraction, deduplication, path tracking, and protection respect, while avoiding any task-specific hardcoding.",
+      "created_at": "2026-03-31T16:59:21.327174"
+    }
+  ]
+}

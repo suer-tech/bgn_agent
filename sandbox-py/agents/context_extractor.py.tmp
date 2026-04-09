@@ -1,0 +1,61 @@
+import re
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from agents.types import ContextResult, TaskContext
+from agents.prompt_storage import get_prompt
+from bitgn.vm.mini_connect import MiniRuntimeClientSync
+from bitgn.vm.mini_pb2 import OutlineRequest, ReadRequest
+from google.protobuf.json_format import MessageToDict
+
+
+def _get_context_extraction_prompt() -> str:
+    try:
+        return get_prompt("context_extractor")
+    except FileNotFoundError:
+        return "You are a Context Extractor Agent."
+
+
+CONTEXT_EXTRACTION_PROMPT = _get_context_extraction_prompt()
+AGENTS_CANDIDATES = ["AGENTS.MD", "AGENTS.md", "Agent.md", "agent.md"]
+
+
+class LinkExtractionResponse(BaseModel):
+    referenced_files: List[str] = Field(default_factory=list)
+
+
+class FileDecisionItem(BaseModel):
+    path: str = Field(description="Relative path to the file to read")
+    reason: str = Field(description="Why this file is needed for the current task")
+
+
+class FileDecisionResponse(BaseModel):
+    files_to_read: List[FileDecisionItem] = Field(
+        default_factory=list,
+        description="List of files that should be read next, with reasons",
+    )
+    reasoning: str = Field(
+        description="Explanation of why these files were chosen and what the agent is looking for"
+    )
+    done: bool = Field(
+        description="Set to true when enough context has been gathered and no more files need to be read"
+    )
+
+
+CONTEXT_EXTRACTOR_SYSTEM_PROMPT = (
+    "You are a Context Extractor Agent. Your job is to determine which files in the workspace "
+    "need to be read to fully understand the context for executing the user's task.\n\n"
+    "Rules:\n"
+    "1. AGENTS.MD is the main source of truth — always analyze it first to understand policies, "
+    "   workflows, and which files or directories are relevant.\n"
+    "2. Only request files that are directly relevant to the user's task.\n"
+    "3. Do NOT request files that are templates (files starting with _ like _template.md), "
+    "   archives, or historical records unless the task specifically requires them.\n"
+    "4. If AGENTS.MD says \"reference only this file\", no additional files need to be read.\n"
+    "5. If AGENTS.MD points to specific policy files or directories, prioritize those.\n"
+    "6. Be conservative — request the minimum number of files needed to understand the task.\n"
+    "7. Set done=true when you have enough context to proceed with task execution.\n"
+    "8. Always use paths exactly as they appear in the directory tree. Do not invent paths.\n\n"
+    "Return your decision as a structured response with files_to_read, reasoning, and done flag."
+)

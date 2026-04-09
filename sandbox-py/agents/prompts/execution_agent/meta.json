@@ -1,0 +1,124 @@
+{
+  "current_version": 17,
+  "versions": [
+    {
+      "version_id": 1,
+      "score": 0.5,
+      "parent_version_id": null,
+      "changes_summary": "",
+      "created_at": "2026-03-30T12:22:45.665261"
+    },
+    {
+      "version_id": 2,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit instructions to attempt reading README.md or other key grounding docs early in discovery to obtain essential context.\nAdded directive to verify file access success and handle access denials gracefully with fallback plans.\nEnhanced planning phase to include detection and avoidance of duplicate or conflicting file changes.\nAdded fallback and clarification steps in plan for handling missing critical information.\nImplemented guidance to detect stagnation patterns and pivot strategies or fail gracefully with partial results.\nImproved report_completion instructions to include grounding references explicitly and allow partial answers when needed.\nAdded notes on maintaining consistent file path references across planning, execution, and reporting.\nEnhanced stagnation rule explanation to encourage adaptive strategies.\nIncluded instructions to document conflicts between instruction sources and resolution choices.\n",
+      "created_at": "2026-03-30T16:40:03.526910"
+    },
+    {
+      "version_id": 3,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added mandatory verification for explicit permissions before including destructive file operations. Incorporated fallback safe actions when destructive actions are disallowed. Strengthened stagnation prevention by detecting repeated identical calls and adjusting plans. Specified exactness in created file paths and content formats, avoiding inclusion of planning summaries as final outputs. Added logic to request missing user input with fallback/timeout to prevent indefinite waiting. Added execution state tracking to prevent duplicate file creation or writes. Emphasized robust handling of protected files in planning and execution to ensure compliance. Clarified report_completion requirements to include actual outputs, not planning content. Enhanced validation steps to confirm completion individually. Integrated safeguards to prevent unauthorized deletions and adapt plans accordingly.",
+      "created_at": "2026-03-30T16:52:07.593694"
+    },
+    {
+      "version_id": 4,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added strict separation between planning outputs and final user-facing outputs to prevent leaking internal details. Introduced validation of output file paths and contents against expected formats before reporting completion. Added detection and suppression of duplicate/redundant file operations within a single task execution. Included strategy to retry or adapt planning if key resources are blocked or missing to avoid incomplete grounding. Clarified that final outputs must exclude planning or reasoning text ensuring clean user output. Strengthened alignment and validation of grounding references against expected evaluation criteria, with adaptive replanning if conflicts arise.",
+      "created_at": "2026-03-30T17:08:50.803530"
+    },
+    {
+      "version_id": 5,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit instructions in the report_completion section mandating minimal, exact answers when a fixed phrase or exact response is required by the task. Clarified that no extra information or elaborations should be included in these cases. Ensured these instructions are generalizable and not task-specific. No other parts of the prompt were changed.",
+      "created_at": "2026-03-30T17:27:59.197447"
+    },
+    {
+      "version_id": 6,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added adaptive planning and answering rules allowing detection of incomplete context extraction and encouraging qualified, transparent answers instead of placeholders. Changed discovery phase to allow skipping restricted AGENTS.MD to avoid unexpected refs. Enhanced report_completion guidelines to require informative answers with limitations stated, avoiding generic placeholders. Introduced guidance to explain conflicts and note assumptions. These changes improve flexibility and user informativeness without losing existing protocol strengths.",
+      "created_at": "2026-03-30T17:28:58.057894"
+    },
+    {
+      "version_id": 7,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit Output Separation and Validation Rules section to ensure a strict division between plan/reasoning files and final output files; mandated explicit validation of generated file contents against expected templates before writing or reporting; enforced policy to create or modify only one file per unique path to avoid duplicate output files.",
+      "created_at": "2026-03-30T17:29:18.829690"
+    },
+    {
+      "version_id": 8,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added a new initial workflow phase 'Phase 0: Input Validation' to explicitly verify all required input data is complete before any tool usage or file modifications. Enforced strict policy to respond exactly without side effects if critical data is missing. Emphasized generic applicability of this validation step to avoid task-specific heuristics and ensure conservative behavior.",
+      "created_at": "2026-03-30T17:29:51.763911"
+    },
+    {
+      "version_id": 9,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit instructions in the Execution phase mandating detailed pre-deletion checks including file path validation, protected files exclusion, and mandatory explicit user confirmation before any destructive operation. Also specified to pause and prompt user if confirmation is not obtained, preventing empty or incomplete outputs. These safety rules are general and apply to all deletion or destructive steps.",
+      "created_at": "2026-03-30T17:30:52.211529"
+    },
+    {
+      "version_id": 10,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit validation rules during execution phase to verify that final created files adhere to expected naming patterns and content templates derived from discovery steps. Included instructions to keep plan documentation files separate from actual output files to avoid confusion. Strengthened guidelines to ensure generic checks preventing errors like generating plan markdown as output artifacts. Preserved existing safety and discovery steps, focusing improvements on output validation and separation.",
+      "created_at": "2026-03-30T17:41:23.525693"
+    },
+    {
+      "version_id": 11,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "1. Introduced a universal no-action rule that prevents creation or execution of any modifying steps if required task input data is incomplete or missing, applied at both planning and execution phases.\n2. Added a hard constraint in the planning phase to veto plans that include modifying steps when completeness criteria are unmet.\n3. Enforced the no-modify veto at execution phase before any tool calls.\n4. Kept all existing safety checks including user confirmation before destructive actions, validation of filenames and content templates before writing files, and plan separation rules.\n5. Maintained original workflow structure and strengths without overfitting to the failed task specifically.\n6. Added clear FIXED comments explaining the new rules and their scope for general applicability.",
+      "created_at": "2026-03-30T17:42:58.853865"
+    },
+    {
+      "version_id": 12,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added detection and handling for stagnation by tracking repeated identical tool calls and triggering fallback strategies.\nAdded contingency branches in planning to handle missing files or unexpected states gracefully.\nEnforced strict sequential execution of plan steps with validation of intermediate outputs before proceeding.\nIncluded error handling with retries/timeouts for tool calls to prevent indefinite blocking.\nPreserved existing no-action rules and safety measures.\nEnhanced instructions on separation of plan files and output files to avoid confusion.\nMaintained a universal veto rule for modifying actions when input data is incomplete.\nExpanded stagnation rule to include fallback strategies and reporting instead of silent looping.",
+      "created_at": "2026-03-30T17:46:40.267117"
+    },
+    {
+      "version_id": 13,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit instructions before writes to enforce strict formatting fidelity checks on output content, including trailing whitespace and newlines. Also introduced a post-generation normalization and exact matching step against discovered templates to prevent subtle formatting mismatches. Added a FIXED comment to highlight this new addition.",
+      "created_at": "2026-03-30T17:51:18.505685"
+    },
+    {
+      "version_id": 14,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit planning and execution requirements to include a generic validation step that ensures the new content matches templates exactly in all characters, including trailing whitespace and newlines. Introduced strict byte-for-byte fidelity enforcement for reusable content blocks, preserving all trailing whitespace and newlines precisely. Added policy to treat trailing newlines as significant formatting elements when recreating content/templates. These changes are marked with FIXED comments and remain general to apply across tasks.",
+      "created_at": "2026-03-30T17:53:10.976825"
+    },
+    {
+      "version_id": 15,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added a new section 'Heuristics for Enhanced Answer Precision and User Alignment' with guidelines to develop reusable heuristics that improve answer precision while respecting policy constraints. Incorporated instructions in execution phase to apply these heuristics when policy evaluation yields imprecise answers. These changes provide mechanisms to balance strict policy adherence with user intent and answer quality, encouraging polite feedback or answer enhancements when appropriate, and ensuring general applicability without task-specific hardcoding.",
+      "created_at": "2026-03-30T18:03:57.901886"
+    },
+    {
+      "version_id": 16,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added a new section 'Answer Shaping and Policy Interpretation' detailing decision rules to detect and handle placeholder answers mandated by policy, emphasizing enhancing informativeness safely and requesting clarifications when needed. This section encourages balancing strict policy adherence with user intent to avoid verbatim low-value placeholder outputs. All changes are general and do not hardcode task-specific information.",
+      "created_at": "2026-03-31T16:58:39.662013"
+    },
+    {
+      "version_id": 17,
+      "score": null,
+      "parent_version_id": 1,
+      "changes_summary": "Added explicit step-level output validation before report_completion to ensure all policy requirements such as deletion references and exact outputs are fulfilled. Enforced a robust output formatting policy to produce exact and policy-compliant final answers, including standardized responses for no-deletion scenarios instead of nonsensical or placeholder text. Incorporated decision logic enhancements to detect and handle placeholder or insufficient outputs, triggering fallback or clarification steps. Added comments (FIXED) marking these improvements to clarify their purpose.",
+      "created_at": "2026-03-31T16:59:38.388592"
+    }
+  ]
+}

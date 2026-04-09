@@ -1,5 +1,4 @@
 import os
-import sys
 import textwrap
 
 from dotenv import load_dotenv
@@ -16,6 +15,8 @@ from bitgn.harness_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
+from agent import run_agent
+
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 MODEL_ID = os.getenv("MODEL_ID") or "gpt-4.1-2025-04-14"
@@ -26,15 +27,17 @@ CLI_CLR = "\x1b[0m"
 CLI_BLUE = "\x1b[34m"
 
 
-def run_task(
+def run_agent_multi(
     model: str, harness_url: str, task_text: str, task_id: str = ""
-) -> "LLMTraceLogger":
-    """Run agent using the State Machine orchestrator."""
+) -> 'LLMTraceLogger':
+    """Run agent using multi-agent orchestrator."""
     from orchestrator import Orchestrator
     from llm_logger import LLMTraceLogger
     from llm_provider import create_provider
 
+    # Create LLM provider
     provider = create_provider()
+
     trace_logger = LLMTraceLogger()
     orchestrator = Orchestrator(provider=provider, trace_logger=trace_logger)
     result = orchestrator.run(
@@ -49,45 +52,36 @@ def run_task(
     print(f"  Answer: {result['final_answer'][:200]}...")
     print(f"  Iterations: {result['iterations_used']}")
     print(f"  Duration: {result['duration_seconds']:.2f}s")
-
+    
     return trace_logger
 
 
 def main() -> None:
-    # Force UTF-8 for Windows terminals
-    if sys.platform == "win32":
-        import io
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
     task_filter = os.sys.argv[1:]
+
+    # Use the orchestrator runtime by default; legacy single-agent mode is opt-out.
+    multi_agent = os.getenv("MULTI_AGENT", "1") == "1"
 
     scores = []
     try:
-        print(f"[{BITGN_URL}] Connecting to BitGN Service...", flush=True)
         client = HarnessServiceClientSync(BITGN_URL)
-        
-        status = client.status(StatusRequest())
-        print(f"BitGN STATUS: {status}", flush=True)
-
-        print(f"Fetching benchmark: {BENCHMARK_ID}...", flush=True)
+        print("Connecting to BitGN", client.status(StatusRequest()))
         res = client.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
-        
         print(
             f"{EvalPolicy.Name(res.policy)} benchmark: {res.benchmark_id} "
-            f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}",
-            flush=True
+            f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
 
-        print(f"{CLI_BLUE}Running in STATE MACHINE mode{CLI_CLR}")
+        if multi_agent:
+            print(f"{CLI_BLUE}Running in MULTI-AGENT mode{CLI_CLR}")
+        else:
+            print(f"{CLI_BLUE}Running in SINGLE-AGENT mode{CLI_CLR}")
 
         for task in res.tasks:
             if task_filter and task.task_id not in task_filter:
                 continue
 
-            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}", flush=True)
-            print(f"Requesting playground from BitGN for {task.task_id}...", flush=True)
-            
+            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
             trial = client.start_playground(
                 StartPlaygroundRequest(
                     benchmark_id=BENCHMARK_ID,
@@ -95,31 +89,35 @@ def main() -> None:
                 )
             )
 
-            print(f"Playground READY. Harness URL: {trial.harness_url}", flush=True)
-            print(
-                f"{CLI_BLUE}INSTRUCTION:{CLI_CLR}\n{trial.instruction.encode('utf-8', errors='replace').decode('utf-8')}\n{'-' * 80}",
-                flush=True
-            )
+            print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
             trace_logger = None
             try:
-                trace_logger = run_task(
-                    MODEL_ID,
-                    trial.harness_url,
-                    trial.instruction,
-                    task_id=task.task_id,
-                )
+                if multi_agent:
+                    trace_logger = run_agent_multi(
+                        MODEL_ID,
+                        trial.harness_url,
+                        trial.instruction,
+                        task_id=task.task_id,
+                    )
+                else:
+                    run_agent(
+                        MODEL_ID,
+                        trial.harness_url,
+                        trial.instruction,
+                        task_id=task.task_id,
+                    )
             except Exception as exc:
                 print(exc)
 
             result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
 
             # Write task summary with score
-            if trace_logger is not None:
+
+            # Write task summary with score
+            if multi_agent and trace_logger is not None:
                 try:
-                    score_detail_str = (
-                        chr(10).join(result.score_detail) if result.score_detail else ""
-                    )
+                    score_detail_str = chr(10).join(result.score_detail) if result.score_detail else ""
                     trace_logger.write_task_summary(
                         score=result.score if result.score >= 0 else None,
                         score_detail=score_detail_str,
