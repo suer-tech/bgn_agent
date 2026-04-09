@@ -50,6 +50,76 @@ CLI_YELLOW = "\x1b[33m"
 CLI_BLUE = "\x1b[34m"
 CLI_CYAN = "\x1b[36m"
 
+# ── Context optimization constants ──
+HISTORY_WINDOW_SIZE = 5
+TOOL_RESULT_MAX_CHARS = 2000
+
+
+def _compress_tool_result(tool_name: str, result_text: str) -> str:
+    """Compress a tool result for storage in conversation history."""
+    if len(result_text) <= TOOL_RESULT_MAX_CHARS:
+        return result_text
+    if tool_name in ("read", "cat"):
+        lines = result_text.split("\n")
+        if len(lines) > 20:
+            head = "\n".join(lines[:12])
+            tail = "\n".join(lines[-5:])
+            return f"{head}\n\n[... {len(lines) - 17} lines omitted, {len(result_text)} chars total ...]\n\n{tail}"
+        return result_text[:TOOL_RESULT_MAX_CHARS] + f"\n[... truncated, {len(result_text)} chars total]"
+    if tool_name in ("tree", "list", "ls"):
+        lines = result_text.split("\n")
+        if len(lines) > 30:
+            return "\n".join(lines[:25]) + f"\n[... {len(lines) - 25} more entries]"
+    if tool_name == "search":
+        lines = result_text.split("\n")
+        if len(lines) > 20:
+            return "\n".join(lines[:18]) + f"\n[... {len(lines) - 18} more matches]"
+    return result_text[:TOOL_RESULT_MAX_CHARS] + f"\n[... truncated, {len(result_text)} chars total]"
+
+
+def _apply_sliding_window(conversation_history: list) -> list:
+    """Keep last HISTORY_WINDOW_SIZE tool-call pairs, collapse older into summary."""
+    pair_count = len(conversation_history) // 2
+    if pair_count <= HISTORY_WINDOW_SIZE:
+        return conversation_history
+
+    cut_point = (pair_count - HISTORY_WINDOW_SIZE) * 2
+    old_messages = conversation_history[:cut_point]
+    recent_messages = conversation_history[cut_point:]
+
+    summary_parts = []
+    for i in range(0, len(old_messages), 2):
+        assistant_msg = old_messages[i]
+        tool_msg = old_messages[i + 1] if i + 1 < len(old_messages) else None
+        tool_name = "?"
+        tool_args_brief = ""
+        tool_calls = assistant_msg.get("tool_calls", [])
+        if tool_calls:
+            func = tool_calls[0].get("function", {})
+            tool_name = func.get("name", "?")
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+                for key in ("path", "pattern", "name", "content"):
+                    if key in args:
+                        tool_args_brief = f" {key}={str(args[key])[:60]}"
+                        break
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result_brief = ""
+        if tool_msg:
+            for line in tool_msg.get("content", "").split("\n"):
+                line = line.strip()
+                if line and not line.startswith("="):
+                    result_brief = f" -> {line[:80]}"
+                    break
+        summary_parts.append(f"  step {i // 2 + 1}: {tool_name}{tool_args_brief}{result_brief}")
+
+    summary_text = (
+        f"[HISTORY SUMMARY — steps 1-{pair_count - HISTORY_WINDOW_SIZE} compressed]\n"
+        + "\n".join(summary_parts)
+    )
+    return [{"role": "user", "content": summary_text}, *recent_messages]
+
 
 class Orchestrator:
     """State Machine orchestrator for PAC1 multi-agent pipeline.
@@ -182,6 +252,10 @@ class Orchestrator:
         print(
             f"{CLI_GREEN}Task Model Ready: {model.domain.value} - {model.requested_effect}{CLI_CLR}"
         )
+        print(
+            f"  Objective: {model.task_objective}\n"
+            f"  Requires file changes: {model.requires_file_changes}"
+        )
 
         # =====================================================================
         # Step 5: Decision Gate (Ambiguity & Security)
@@ -287,13 +361,14 @@ class Orchestrator:
             step_name = f"step_{iteration + 1}"
             print(f"\n{CLI_YELLOW}--- {step_name} ---{CLI_CLR}")
 
-            # 4a. Plan next step
+            # 4a. Plan next step (with sliding window on history)
             prompt = build_planner_prompt(state)
+            windowed_history = _apply_sliding_window(state["conversation_history"])
 
             try:
                 next_step = plan_next_step(
                     prompt=prompt,
-                    conversation_history=state["conversation_history"],
+                    conversation_history=windowed_history,
                     llm_provider=self.provider,
                     trace_logger=self.trace_logger,
                     step_name=step_name,
@@ -440,22 +515,31 @@ class Orchestrator:
             print(f"{CLI_GREEN}OUT{CLI_CLR}: {result_text[:200]}...")
 
             # ----- Step 4e: Post-context Security Guard -----
+            # Heuristic flags suspicious content → LLM verifies → result
+            # passed to execution agent as context (no hard block).
             if tool_name in ("read", "cat") and len(result_text) > 50:
                 read_path = tool_args.get("path", "")
                 security_check = run_post_context_security(
                     result_text, self.provider, self.trace_logger,
                     file_path=read_path,
+                    workspace_rules=state["workspace_rules"],
                 )
-                if security_check.reason and "trusted" not in (security_check.reason or "").lower() and "safe" not in (security_check.reason or "").lower():
-                    print(f"{CLI_YELLOW}  [Security] scanned {read_path}{CLI_CLR}")
                 if not security_check.allowed:
+                    injection_type = security_check.injection_type or "unknown"
                     print(
-                        f"{CLI_RED}SECURITY BLOCK: Content detected as injection!{CLI_CLR}"
+                        f"{CLI_YELLOW}  [Security] LLM confirmed threat in {read_path}: "
+                        f"{injection_type} — {security_check.reason[:120]}{CLI_CLR}"
                     )
-                    state["final_outcome"] = "OUTCOME_DENIED_SECURITY"
-                    state["is_completed"] = True
-                    final_answer = f"Security block: {security_check.reason}"
-                    break
+                    result_text += (
+                        f"\n\n[SECURITY ANALYSIS — {injection_type.upper()}]: "
+                        f"{security_check.reason}"
+                    )
+                elif security_check.reason and "heuristic" not in (security_check.reason or "").lower():
+                    # LLM was called but cleared the content — pass that context too
+                    print(f"{CLI_GREEN}  [Security] LLM cleared {read_path}: {security_check.reason[:100]}{CLI_CLR}")
+                    result_text += (
+                        f"\n\n[SECURITY ANALYSIS]: {security_check.reason}"
+                    )
 
             # ----- Step 4e2: Track reads + sequential read guardrail -----
             if tool_name in ("read", "cat"):
@@ -555,7 +639,8 @@ class Orchestrator:
                 }
             )
 
-            # Add to conversation history
+            # Add to conversation history (with compressed tool results)
+            compressed_result = _compress_tool_result(tool_name, result_text)
             state["conversation_history"].append(
                 {
                     "role": "assistant",
@@ -575,7 +660,7 @@ class Orchestrator:
             state["conversation_history"].append(
                 {
                     "role": "tool",
-                    "content": result_text,
+                    "content": compressed_result,
                     "tool_call_id": step_name,
                 }
             )

@@ -61,11 +61,27 @@ Respond ONLY with the JSON object. No markdown, no explanation."""
 class LLMProvider:
     """Base class for LLM providers."""
 
+    def __init__(self):
+        self.stats = {
+            "llm_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
     def complete(self, messages: List[Dict[str, Any]]) -> NextStep:
         raise NotImplementedError
 
     def complete_as(self, messages: List[Dict[str, Any]], response_type: Type[T]) -> T:
         raise NotImplementedError
+
+    def _record_usage(self, usage) -> None:
+        """Record token usage from API response."""
+        self.stats["llm_calls"] += 1
+        if usage:
+            self.stats["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+            self.stats["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+            self.stats["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
 
     def _extract_json(self, text: str) -> str:
         """Extract JSON from text, auto-close brackets, handle various formats."""
@@ -123,6 +139,7 @@ class LLMProvider:
 
 class OpenRouterProvider(LLMProvider):
     def __init__(self, model: str):
+        super().__init__()
         api_key = os.getenv("OPENROUTER_API_KEY")
         base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         if not api_key:
@@ -179,6 +196,8 @@ class OpenRouterProvider(LLMProvider):
                 time.sleep(wait)
                 continue
 
+            self._record_usage(getattr(resp, "usage", None))
+
             choice = resp.choices[0].message
             text = choice.content
 
@@ -211,6 +230,20 @@ class OpenRouterProvider(LLMProvider):
 
 
 class AntigravityProvider(LLMProvider):
+    """Human-in-the-loop provider: writes prompt to file, waits for response file.
+
+    For parallel execution, each task gets isolated files via task_id + step counter.
+    Files are placed in a dedicated .antigravity/ directory under the project root.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".antigravity")
+        os.makedirs(self._base_dir, exist_ok=True)
+        self._step_counter = 0
+        print(f"{CLI_GREEN}Using Antigravity (human-in-the-loop) provider{CLI_CLR}")
+        print(f"{CLI_GREEN}Exchange directory: {self._base_dir}{CLI_CLR}")
+
     def complete(self, messages: List[Dict[str, Any]]) -> NextStep:
         return self.complete_as(messages, NextStep)
 
@@ -218,35 +251,62 @@ class AntigravityProvider(LLMProvider):
         import json, os, time
 
         task_id = os.environ.get("PAC1_TASK_ID", "")
+        self._step_counter += 1
+        step = self._step_counter
+
+        # Unique filenames per task + step to avoid collisions in parallel mode
         suffix = f"_{task_id}" if task_id else ""
-        req_file = f".llm_request{suffix}.json"
-        res_file = f".llm_response{suffix}.json"
+        req_file = os.path.join(self._base_dir, f"request{suffix}_s{step:02d}.json")
+        res_file = os.path.join(self._base_dir, f"response{suffix}_s{step:02d}.json")
+
+        # Also write a "latest" symlink/copy for convenience
+        req_latest = os.path.join(self._base_dir, f"request{suffix}.json")
 
         # 1. Clean up old files to ensure we don't read stale data
-        if os.path.exists(req_file):
-            os.remove(req_file)
-        if os.path.exists(res_file):
-            os.remove(res_file)
+        for f in [req_file, res_file]:
+            if os.path.exists(f):
+                os.remove(f)
 
-        # 2. Write new request
+        # 2. Build request with schema hint embedded
+        schema_hint = build_schema_hint_for_type(response_type)
+        request_payload = {
+            "task_id": task_id,
+            "step": step,
+            "response_type": response_type.__name__,
+            "schema_hint": schema_hint,
+            "messages": messages,
+        }
+
+        # 3. Write request
         print(
-            f"\x1b[33m[Antigravity] Writing messages to {req_file}... (Size: {len(str(messages))} chars)\x1b[0m",
+            f"\x1b[33m[Antigravity/{task_id}/s{step}] Writing request to {req_file} "
+            f"(Size: {len(str(messages))} chars, Type: {response_type.__name__})\x1b[0m",
             flush=True,
         )
         with open(req_file, "w", encoding="utf-8") as f:
-            json.dump(messages, f, indent=2, ensure_ascii=False)
+            json.dump(request_payload, f, indent=2, ensure_ascii=False)
+        # Copy to latest for convenience
+        with open(req_latest, "w", encoding="utf-8") as f:
+            json.dump(request_payload, f, indent=2, ensure_ascii=False)
 
         print(
-            f"\x1b[33m[Antigravity] Prompt written. Waiting for {res_file}... Go to that file and provide JSON response.\x1b[0m",
+            f"\x1b[33m[Antigravity/{task_id}/s{step}] Waiting for response file: {res_file}\x1b[0m",
             flush=True,
         )
 
-        # 3. Wait for response file to be created
+        # 4. Wait for response file to be created
+        wait_count = 0
         while not os.path.exists(res_file):
             time.sleep(1)
+            wait_count += 1
+            if wait_count % 60 == 0:
+                print(
+                    f"\x1b[33m[Antigravity/{task_id}/s{step}] Still waiting... ({wait_count}s)\x1b[0m",
+                    flush=True,
+                )
 
-        # 4. Wait a bit more to ensure file write is finished and try to parse
-        MAX_RETRIES = 5
+        # 5. Wait a bit more to ensure file write is finished and try to parse
+        MAX_RETRIES = 10
         data = None
         for i in range(MAX_RETRIES):
             try:
@@ -261,17 +321,17 @@ class AntigravityProvider(LLMProvider):
                     break
             except (json.JSONDecodeError, IOError) as e:
                 if i == MAX_RETRIES - 1:
-                    print(f"Final attempt to parse JSON failed: {e}")
+                    print(f"[Antigravity/{task_id}/s{step}] Final attempt to parse JSON failed: {e}")
                     raise
-                print(f"Attempt {i + 1} to parse {res_file} failed, retrying...")
+                print(f"[Antigravity/{task_id}/s{step}] Attempt {i + 1} to parse failed, retrying...")
 
-        # 5. Clean up and return
+        # 6. Clean up response file (keep request for debugging)
         if os.path.exists(res_file):
             os.remove(res_file)
         if data is None:
             raise ValueError(f"Failed to read valid JSON from {res_file}")
 
-        # Robust parsing for human-provided JSON (might have markdown)
+        # 7. Robust parsing for human-provided JSON (might have markdown or nested string)
         if isinstance(data, str):
             data = json.loads(self._extract_json(data))
         elif isinstance(data, dict):
@@ -286,10 +346,15 @@ class ClaudeCodeProvider(LLMProvider):
 
     Uses the user's existing Claude Max/Pro subscription — no separate API key needed.
     Invokes `claude -p` with JSON output and parses the result.
+
+    Thread-safe: each complete_as() call spawns its own subprocess.
+    For parallel execution (10 threads), retries handle rate limits from Claude API.
     """
 
     def __init__(self, model: str = ""):
+        super().__init__()
         self.model = model
+        self._task_id = os.environ.get("PAC1_TASK_ID", "")
         print(f"{CLI_GREEN}Using Claude Code provider (claude CLI){CLI_CLR}")
 
     def complete(self, messages: List[Dict[str, Any]]) -> NextStep:
@@ -300,7 +365,8 @@ class ClaudeCodeProvider(LLMProvider):
         schema_hint = build_schema_hint_for_type(response_type)
         full_prompt = full_prompt + "\n\n=== RESPONSE FORMAT ===\n" + schema_hint
 
-        print(f"{CLI_DIM}Calling claude CLI ({len(full_prompt)} chars)...{CLI_CLR}")
+        tag = f"[claude/{self._task_id}]" if self._task_id else "[claude]"
+        print(f"{CLI_DIM}{tag} Calling claude CLI ({len(full_prompt)} chars)...{CLI_CLR}", flush=True)
 
         cmd = [
             "claude", "-p",
@@ -311,40 +377,50 @@ class ClaudeCodeProvider(LLMProvider):
         if self.model:
             cmd.extend(["--model", self.model])
 
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 result = subprocess.run(
                     cmd,
                     input=full_prompt.encode("utf-8"),
                     capture_output=True,
-                    timeout=300,
+                    timeout=600,
                 )
                 stdout = result.stdout.decode("utf-8", errors="replace")
                 stderr = result.stderr.decode("utf-8", errors="replace")
 
                 if result.returncode != 0:
-                    print(f"{CLI_RED}claude CLI error (rc={result.returncode}): {stderr[:500]}{CLI_CLR}")
+                    err_lower = stderr.lower()
+                    is_rate_limit = "rate" in err_lower or "429" in stderr or "overloaded" in err_lower or "capacity" in err_lower
+                    print(f"{CLI_RED}{tag} claude CLI error (rc={result.returncode}): {stderr[:500]}{CLI_CLR}", flush=True)
                     if attempt < max_retries - 1:
-                        wait = 5 * (attempt + 1)
-                        print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Waiting {wait}s...{CLI_CLR}")
+                        wait = (10 * (attempt + 1)) if is_rate_limit else (5 * (attempt + 1))
+                        print(f"{CLI_YELLOW}{tag} [Retry {attempt + 1}/{max_retries}] Waiting {wait}s...{CLI_CLR}", flush=True)
                         time.sleep(wait)
                         continue
                     raise ValueError(f"claude CLI failed: {stderr[:500]}")
 
+                self._record_usage(None)  # count the call; claude CLI doesn't expose token counts
+
                 # Parse the JSON envelope from claude CLI
+                text_response = ""
                 try:
                     envelope = json.loads(stdout)
                     text_response = envelope.get("result", "")
+                    # Try to extract usage from envelope if available
+                    usage_data = envelope.get("usage", {})
+                    if usage_data:
+                        self.stats["prompt_tokens"] += usage_data.get("input_tokens", 0)
+                        self.stats["completion_tokens"] += usage_data.get("output_tokens", 0)
+                        self.stats["total_tokens"] += usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0)
                 except json.JSONDecodeError:
-                    # Fallback: treat stdout as raw text
                     text_response = stdout
 
                 if not text_response:
                     raise ValueError("Empty response from claude CLI")
 
                 print(
-                    f"{CLI_DIM}Claude response ({len(text_response)} chars): {text_response[:300]}...{CLI_CLR}",
+                    f"{CLI_DIM}{tag} Response ({len(text_response)} chars): {text_response[:300]}...{CLI_CLR}",
                     flush=True,
                 )
 
@@ -354,13 +430,14 @@ class ClaudeCodeProvider(LLMProvider):
 
             except subprocess.TimeoutExpired:
                 if attempt < max_retries - 1:
-                    print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Timeout, retrying...{CLI_CLR}")
+                    print(f"{CLI_YELLOW}{tag} [Retry {attempt + 1}/{max_retries}] Timeout, retrying...{CLI_CLR}", flush=True)
                     continue
-                raise ValueError("claude CLI timed out after 300 seconds")
+                raise ValueError(f"claude CLI timed out after 600 seconds")
             except (json.JSONDecodeError, Exception) as e:
                 if attempt < max_retries - 1 and "timed out" not in str(e):
-                    print(f"{CLI_YELLOW}[Retry {attempt + 1}/{max_retries}] Error: {e}, retrying...{CLI_CLR}")
-                    time.sleep(3)
+                    wait = 5 * (attempt + 1)
+                    print(f"{CLI_YELLOW}{tag} [Retry {attempt + 1}/{max_retries}] Error: {e}, waiting {wait}s...{CLI_CLR}", flush=True)
+                    time.sleep(wait)
                     continue
                 raise
 
@@ -375,6 +452,7 @@ class OpencodeProvider(LLMProvider):
     """
 
     def __init__(self):
+        super().__init__()
         print(f"{CLI_GREEN}Using opencode provider{CLI_CLR}")
 
     def complete(self, messages: List[Dict[str, Any]]) -> NextStep:
@@ -467,8 +545,6 @@ class OpencodeProvider(LLMProvider):
 
         return "\n".join(combined_text)
 
-        return "\n".join(combined_text)
-
 
 def create_provider() -> LLMProvider:
     """Factory function to create the configured LLM provider."""
@@ -479,7 +555,6 @@ def create_provider() -> LLMProvider:
         print(f"{CLI_GREEN}Using OpenRouter provider with model: {model}{CLI_CLR}")
         return OpenRouterProvider(model=model)
     elif provider_name == "antigravity":
-        print(f"{CLI_GREEN}Using Antigravity (human-in-the-loop) provider{CLI_CLR}")
         return AntigravityProvider()
     elif provider_name == "claude":
         print(f"{CLI_GREEN}Using Claude Code provider (model: {model or 'default'}){CLI_CLR}")

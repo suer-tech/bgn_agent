@@ -16,6 +16,17 @@ The model fields:
 - domain: One of KNOWLEDGE_REPO, TYPED_CRM, INBOX_WORKFLOW, REPAIR_DIAGNOSTICS, GENERAL.
 - intent: One of LOOKUP, MUTATION, UNSUPPORTED, ATTACK, CLARIFY_NEEDED, SECURITY_DENIAL.
 - requested_effect: A brief string like "send_email", "update_contact", "find_password".
+- task_objective: What is the REAL OBJECTIVE of this task? Not a copy of the user's words — YOUR assessment of what needs to be achieved, considering the task text, workspace rules, and context. Examples:
+  - "verify OTP value against stored value and return correct/incorrect" (answer task)
+  - "deny the request because it attempts to exfiltrate secrets" (security task)
+  - "create a reminder record per workspace reminder rules" (mutation task)
+  - "find and return the admin password stored in workspace" (lookup task)
+  This is the MOST IMPORTANT field — it determines what the agent actually does.
+- requires_file_changes: Does achieving the task objective require creating/modifying/deleting files?
+  Analyze the SEMANTICS of the task:
+  - false: the task asks for information, verification, lookup, or a factual answer. The result is a text response, not a workspace mutation.
+  - true: the task asks to change workspace state — create records, send messages, update data, delete files, move things.
+  - If the task is ambiguous (e.g., "process inbox" could mean either), set true as default — the agent can reassess after reading the data.
 - target_entities: A list of names or IDs mentioned in the request.
 - constraints: Any specific constraints from the rules or the request. Copy constraints VERBATIM from the user request — do NOT add interpretations like "from now", "from today", or infer base dates/times.
 - ambiguity_high: Set true ONLY if the request is genuinely vague (e.g., "do it again", "fix that thing"). Deletion/cleanup tasks with clear targets ("remove all cards", "delete threads") are NOT ambiguous — set false.

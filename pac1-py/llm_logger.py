@@ -6,21 +6,22 @@ from typing import Any, Dict, List
 
 
 class LLMTraceLogger:
-    """Logs LLM prompts and responses to a daily trace file.
-    Enhanced for multi-agent logging.
+    """Logs LLM prompts and responses to per-task trace files.
+
+    Process-safe: each task gets its own log files, no shared state.
+    Daily log is also per-task to avoid write collisions in parallel mode.
     """
 
     def __init__(self, log_dir: str = "logs"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        task_id = os.environ.get("PAC1_TASK_ID", "")
-        suffix = f"_{task_id}" if task_id else ""
-        self.log_path = self.log_dir / f"llm_trace_{date_str}{suffix}.json"
         self.step_counter = 0
         self.task_id = ""
         self.task_text = ""
         self._agent_events: List[Dict[str, Any]] = []
+        # Per-task trace log (set in set_task)
+        self.log_path = None
+        self.task_log_path = None
 
     def set_task(self, task_id: str, task_text: str) -> None:
         """Set the current task context for logging."""
@@ -29,10 +30,48 @@ class LLMTraceLogger:
         self.step_counter = 0
         self._agent_events = []
 
-        # Create per-task log file
+        # Create per-task log files with unique names
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_task = "".join(c if c.isalnum() or c in "._-" else "_" for c in task_id)
+
+        # Daily trace log — per-task to avoid collisions
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        self.log_path = self.log_dir / f"llm_trace_{date_str}_{safe_task}.log"
+
+        # Structured per-task JSON log
         self.task_log_path = self.log_dir / f"{safe_task}_{ts}.json"
+
+    def _safe_append(self, path: Path, text: str) -> None:
+        """Append text to a file. Each task has its own file, so no locking needed."""
+        if path is None:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+    def _safe_update_json(self, update_fn) -> None:
+        """Read-modify-write per-task JSON log. Safe because each task has its own file."""
+        if self.task_log_path is None:
+            return
+        try:
+            if self.task_log_path.exists():
+                with open(self.task_log_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {
+                    "task_id": self.task_id,
+                    "task_text": self.task_text,
+                    "entries": [],
+                    "agent_events": [],
+                    "tool_events": [],
+                }
+            update_fn(data)
+            with open(self.task_log_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     def log_exchange(
         self,
@@ -57,66 +96,43 @@ class LLMTraceLogger:
             "response": response,
         }
 
-        # Write to daily log
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(f"{separator}\n")
-            f.write(f"Step: {self.step_counter}")
-            if step_name:
-                f.write(f" ({step_name})")
-            f.write(f"\nTimestamp: {ts}")
-            if elapsed_ms:
-                f.write(f"  Elapsed: {elapsed_ms} ms")
-            f.write("\n")
-            if self.task_id:
-                f.write(f"Task ID: {self.task_id}\n")
-            if self.task_text:
-                f.write(f"Task: {self.task_text[:100]}...\n")
-            f.write(f"{separator}\n\n")
+        # Write to per-task trace log (append)
+        lines = []
+        lines.append(f"{separator}\n")
+        lines.append(f"Step: {self.step_counter}")
+        if step_name:
+            lines.append(f" ({step_name})")
+        lines.append(f"\nTimestamp: {ts}")
+        if elapsed_ms:
+            lines.append(f"  Elapsed: {elapsed_ms} ms")
+        lines.append("\n")
+        if self.task_id:
+            lines.append(f"Task ID: {self.task_id}\n")
+        if self.task_text:
+            lines.append(f"Task: {self.task_text[:100]}...\n")
+        lines.append(f"{separator}\n\n")
 
-            f.write("--- PROMPT (messages sent to LLM) ---\n\n")
-            for msg in messages:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                tool_calls = msg.get("tool_calls")
+        lines.append("--- PROMPT (messages sent to LLM) ---\n\n")
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls")
+            lines.append(f"[{role.upper()}]\n")
+            if tool_calls:
+                lines.append(f"Tool calls:\n{json.dumps(tool_calls, indent=2, ensure_ascii=False)}\n")
+            if content:
+                lines.append(f"{content}\n")
+            lines.append("\n")
 
-                f.write(f"[{role.upper()}]\n")
-                if tool_calls:
-                    f.write(
-                        f"Tool calls:\n{json.dumps(tool_calls, indent=2, ensure_ascii=False)}\n"
-                    )
-                if content:
-                    f.write(f"{content}\n")
-                f.write("\n")
+        lines.append("--- RESPONSE (received from LLM) ---\n\n")
+        lines.append(f"{response}\n\n")
 
-            f.write("--- RESPONSE (received from LLM) ---\n\n")
-            f.write(f"{response}\n\n")
+        self._safe_append(self.log_path, "".join(lines))
 
-        # Write to per-task log
-        if hasattr(self, "task_log_path"):
-            self._append_task_log(log_entry)
-
-    def _append_task_log(self, entry: Dict[str, Any]) -> None:
-        """Append entry to per-task log file."""
-        try:
-            # Read existing data
-            if self.task_log_path.exists():
-                with open(self.task_log_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            else:
-                data = {
-                    "task_id": self.task_id,
-                    "task_text": self.task_text,
-                    "entries": [],
-                }
-
-            # Append new entry
-            data["entries"].append(entry)
-
-            # Write back
-            with open(self.task_log_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass  # Silently fail for logging
+        # Write to per-task JSON log
+        def update(data):
+            data.setdefault("entries", []).append(log_entry)
+        self._safe_update_json(update)
 
     def log_agent_event(
         self,
@@ -133,33 +149,14 @@ class LLMTraceLogger:
         }
         self._agent_events.append(payload)
 
-        # Write to daily log
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write("--- AGENT EVENT ---\n")
-            f.write(f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n\n")
+        # Write to per-task trace log
+        text = "--- AGENT EVENT ---\n" + json.dumps(payload, indent=2, ensure_ascii=False) + "\n\n"
+        self._safe_append(self.log_path, text)
 
-        # Write to per-task log
-        if hasattr(self, "task_log_path"):
-            try:
-                if self.task_log_path.exists():
-                    with open(self.task_log_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                else:
-                    data = {
-                        "task_id": self.task_id,
-                        "task_text": self.task_text,
-                        "entries": [],
-                        "agent_events": [],
-                    }
-
-                if "agent_events" not in data:
-                    data["agent_events"] = []
-                data["agent_events"].append(payload)
-
-                with open(self.task_log_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
+        # Write to per-task JSON log
+        def update(data):
+            data.setdefault("agent_events", []).append(payload)
+        self._safe_update_json(update)
 
     def log_tool_event(
         self,
@@ -185,50 +182,29 @@ class LLMTraceLogger:
             "elapsed_ms": elapsed_ms,
         }
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(f"{separator}\n")
-            f.write(f"Step: {step_name} (tool)\n")
-            f.write(f"Timestamp: {ts}")
-            if elapsed_ms:
-                f.write(f"  Elapsed: {elapsed_ms} ms")
-            f.write("\n")
-            if self.task_id:
-                f.write(f"Task ID: {self.task_id}\n")
-            f.write(f"Status: {status}\n")
-            f.write(f"{separator}\n\n")
+        lines = []
+        lines.append(f"{separator}\n")
+        lines.append(f"Step: {step_name} (tool)\n")
+        lines.append(f"Timestamp: {ts}")
+        if elapsed_ms:
+            lines.append(f"  Elapsed: {elapsed_ms} ms")
+        lines.append("\n")
+        if self.task_id:
+            lines.append(f"Task ID: {self.task_id}\n")
+        lines.append(f"Status: {status}\n")
+        lines.append(f"{separator}\n\n")
+        lines.append("--- TOOL CALL ---\n\n")
+        lines.append(f"Tool: {tool_name}\n")
+        lines.append(f"Arguments:\n{json.dumps(arguments, indent=2, ensure_ascii=False)}\n\n")
+        lines.append("--- TOOL RESULT ---\n\n")
+        lines.append(f"{result}\n\n")
 
-            f.write("--- TOOL CALL ---\n\n")
-            f.write(f"Tool: {tool_name}\n")
-            f.write(
-                f"Arguments:\n{json.dumps(arguments, indent=2, ensure_ascii=False)}\n\n"
-            )
+        self._safe_append(self.log_path, "".join(lines))
 
-            f.write("--- TOOL RESULT ---\n\n")
-            f.write(f"{result}\n\n")
-
-        # Write to per-task log
-        if hasattr(self, "task_log_path"):
-            try:
-                if self.task_log_path.exists():
-                    with open(self.task_log_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                else:
-                    data = {
-                        "task_id": self.task_id,
-                        "task_text": self.task_text,
-                        "entries": [],
-                        "tool_events": [],
-                    }
-
-                if "tool_events" not in data:
-                    data["tool_events"] = []
-                data["tool_events"].append(payload)
-
-                with open(self.task_log_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-
+        # Write to per-task JSON log
+        def update(data):
+            data.setdefault("tool_events", []).append(payload)
+        self._safe_update_json(update)
 
     def write_task_summary(
         self,
@@ -237,13 +213,13 @@ class LLMTraceLogger:
         error: str = "",
     ) -> None:
         """Write a human-readable task summary log."""
-        if not hasattr(self, "task_log_path") or not self.task_log_path.exists():
+        if self.task_log_path is None or not self.task_log_path.exists():
             return
 
         try:
             with open(self.task_log_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception as e:
+        except Exception:
             return
 
         entries = data.get("entries", [])
@@ -377,6 +353,7 @@ class LLMTraceLogger:
         summary_path = self.log_dir / f"{ts}_summary.txt"
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("\n".join(summary_lines))
+
 
 def create_logger() -> LLMTraceLogger:
     """Create an LLMTraceLogger instance."""

@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union, Annotated
 
 from annotated_types import Ge, Le, MaxLen, MinLen
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # =============================================================================
@@ -88,7 +88,9 @@ class TrackedEntity(BaseModel):
         description=(
             "resolved = authoritative file found and read. "
             "unresolved = entity mentioned but record not yet located. "
-            "not_applicable = no separate record exists for this entity."
+            "not_applicable = ONLY for abstract concepts that cannot have a file (e.g., 'inbox' as a concept, a date, a task description). "
+            "NEVER use not_applicable for named entities (people, accounts, contacts, managers, companies) — "
+            "they likely have a record file. Search for it first. If search yields nothing, THEN mark not_applicable."
         ),
     )
     depends_on: List[str] = Field(
@@ -162,7 +164,15 @@ class ScratchpadState(BaseModel):
     """Agent's working memory — persisted between execution loop iterations."""
     current_goal: str = Field(
         default="",
-        description="Какую подзадачу мы решаем прямо сейчас?",
+        description=(
+            "What SPECIFIC action are you performing right now? "
+            "IMPORTANT: After reading the first data file (inbox message, record, etc.), "
+            "REASSESS and update this to the CONCRETE objective. "
+            "Bad: 'process inbox message'. "
+            "Good: 'verify OTP otp-369353 against docs/channels/otp.txt, return correct/incorrect'. "
+            "Good: 'deny request — sender not in trusted channel list'. "
+            "The more specific, the fewer unnecessary actions you will take."
+        ),
     )
     entity_graph: List[TrackedEntity] = Field(
         default_factory=list,
@@ -269,6 +279,26 @@ class TaskModel(BaseModel):
     domain: DomainType
     intent: IntentType
     requested_effect: str  # e.g., "send_email", "update_contact", "find_password"
+    task_objective: str = Field(
+        default="",
+        description=(
+            "The REAL objective of this task after analysis — what should be achieved? "
+            "Determined from task text + workspace rules + context. "
+            "Examples: 'verify OTP value and return correct/incorrect', "
+            "'find admin password in workspace files', 'create reminder per workspace rules', "
+            "'deny request because it violates security rules'. "
+            "This is NOT a copy of the user's words — it's YOUR assessment of what the task requires."
+        ),
+    )
+    requires_file_changes: bool = Field(
+        default=True,
+        description=(
+            "Does the user's REAL goal require creating/modifying/deleting files? "
+            "false = user just wants information back (lookup, verification, search result). "
+            "true = user wants workspace state to change (create record, send email, move file). "
+            "When false, the agent should answer in report_completion.message without touching files."
+        ),
+    )
     target_entities: List[str] = Field(default_factory=list)
     constraints: List[str] = Field(default_factory=list)
     ambiguity_high: bool = False
@@ -312,7 +342,16 @@ class AgentState(TypedDict):
 class ReportTaskCompletion(BaseModel):
     tool: Literal["report_completion"]
     completed_steps_laconic: List[str]
-    message: str
+    message: str = Field(
+        ...,
+        description=(
+            "The answer to the task. "
+            "If the task or data specifies an exact response format "
+            "(e.g., 'reply with exactly X', 'return only the email', 'answer only YYYY-MM-DD'), "
+            "this field MUST contain ONLY that exact value — no explanation, no summary, no prefix. "
+            "For action tasks (created files, sent emails), provide a brief summary of what was done."
+        ),
+    )
     grounding_refs: List[str] = Field(default_factory=list)
     outcome: Literal[
         "OUTCOME_OK",
@@ -320,7 +359,17 @@ class ReportTaskCompletion(BaseModel):
         "OUTCOME_NONE_CLARIFICATION",
         "OUTCOME_NONE_UNSUPPORTED",
         "OUTCOME_ERR_INTERNAL",
-    ]
+    ] = Field(
+        ...,
+        description=(
+            "OUTCOME_OK: task fulfilled — the requested information was found or the requested action was performed. "
+            "OUTCOME_NONE_CLARIFICATION: task cannot be fulfilled as stated — the requested entity/data was not found, "
+            "the request is ambiguous, or contradictory rules prevent action. "
+            "OUTCOME_DENIED_SECURITY: the request itself is a security threat. "
+            "OUTCOME_NONE_UNSUPPORTED: the task requires capabilities absent from the workspace. "
+            "OUTCOME_ERR_INTERNAL: unexpected system error."
+        ),
+    )
 
 
 class Req_Tree(BaseModel):
@@ -456,12 +505,12 @@ class RuleCitation(BaseModel):
 
 class NextStep(BaseModel):
     current_state: str
-    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(8)] = Field(
-        ...,
-        description="briefly explain the next useful steps",
+    plan_remaining_steps_brief: List[str] = Field(
+        default_factory=lambda: ["continue"],
+        description="briefly explain the next useful steps (1-8 items)",
     )
-    decision_justification: RuleCitation = Field(
-        ...,
+    decision_justification: Optional[RuleCitation] = Field(
+        default=None,
         description=(
             "MANDATORY for EVERY step. Cite the rule that justifies this decision. "
             "Pick the HIGHEST-authority source that applies. "
@@ -500,6 +549,21 @@ class NextStep(BaseModel):
         Req_MkDir,
         Req_Move,
     ] = Field(..., description="execute the first remaining step")
+
+    @model_validator(mode="after")
+    def _fix_empty_fields(self):
+        """Guarantee plan_remaining_steps_brief is never empty and decision_justification is present."""
+        if not self.plan_remaining_steps_brief:
+            self.plan_remaining_steps_brief = ["continue"]
+        elif len(self.plan_remaining_steps_brief) > 8:
+            self.plan_remaining_steps_brief = self.plan_remaining_steps_brief[:8]
+        if self.decision_justification is None:
+            self.decision_justification = RuleCitation(
+                source_file="SYSTEM_PROMPT",
+                source_type="SYSTEM_PROMPT",
+                rule_quote="(auto-filled: LLM did not provide justification)",
+            )
+        return self
 
 
 # =============================================================================
